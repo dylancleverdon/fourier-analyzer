@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+.DS_Store
+# never commit audio or third-party presets
+*.wav
+*.mp3
+*.aif
+*.aiff
+*.flac
+*.SerumPreset

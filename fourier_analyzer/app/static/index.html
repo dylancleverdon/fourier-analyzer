@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fourier Analyzer</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span class="logo">∿</span> Fourier Analyzer <span class="ver">v{{VERSION}}</span></div>
+  <div class="top-actions">
+    <button id="updateBtn" class="pill" title="Check for updates">Checking for updates…</button>
+    <button id="settingsBtn" class="ghost" title="Settings">Settings</button>
+  </div>
+</header>
+
+<div class="layout">
+  <aside class="side">
+    <label id="drop" class="drop">
+      <input id="fileIn" type="file" accept="audio/*,.wav,.aif,.aiff,.mp3,.flac,.m4a" hidden>
+      <div class="drop-icon">⤓</div>
+      <div><b>Drop a song section</b></div>
+      <div class="muted">WAV · AIFF · MP3 · FLAC · M4A</div>
+    </label>
+    <label class="check small"><input id="optDrums" type="checkbox" checked> split drum kit (kick/snare/hats)</label>
+    <h3>Projects</h3>
+    <ul id="projects" class="projects"></ul>
+  </aside>
+
+  <main id="main">
+    <section id="empty" class="empty">
+      <h1>Pull a sound apart, rebuild it in Serum 2.</h1>
+      <ol>
+        <li>Drop a section of a track. It is split into stems and drum parts, and the instruments are labelled.</li>
+        <li>Pick a stem (e.g. the bass), split it into layers if two basses are stacked, and drag over the part you want.</li>
+        <li><b>Fourier analysis</b> shows the spectrum, harmonics, notes, envelope, LFO and timing.</li>
+        <li><b>Reconstruct</b> searches for a Serum patch (stock waves first), checks it against the original, and exports a .SerumPreset plus MIDI with exact timing.</li>
+      </ol>
+    </section>
+
+    <section id="proj" hidden>
+      <div class="proj-head">
+        <div>
+          <h2 id="projName"></h2>
+          <div class="muted" id="projInfo"></div>
+        </div>
+        <div class="bpm">BPM <input id="bpm" type="number" step="0.01" min="40" max="300"></div>
+      </div>
+      <div id="jobBox" class="job" hidden>
+        <div class="job-row"><span id="jobStage"></span><span id="jobBest"></span></div>
+        <div class="bar"><div id="jobBar"></div></div>
+        <pre id="jobLog"></pre>
+      </div>
+
+      <div class="card">
+        <h3>Detected instruments</h3>
+        <div id="instruments" class="chips"></div>
+      </div>
+
+      <div class="card">
+        <h3>Stems</h3>
+        <div id="stems" class="stems"></div>
+      </div>
+
+      <div class="card" id="editor" hidden>
+        <div class="ed-head">
+          <h3 id="edTitle">Selection</h3>
+          <div class="ed-tools">
+            <span id="selInfo" class="muted mono"></span>
+            <button id="playSel">▶ Play selection</button>
+            <button id="clearSel" class="ghost">Clear</button>
+            <button id="splitBtn" class="ghost" title="Separate stacked layers inside this stem">Split layers…</button>
+          </div>
+        </div>
+        <canvas id="wave" height="140"></canvas>
+        <img id="spec" alt="spectrogram" hidden>
+        <div class="tabs">
+          <button class="tab active" data-tab="fourier">Fourier analysis</button>
+          <button class="tab" data-tab="recon">Reconstruct Serum patch</button>
+        </div>
+
+        <div class="tabpane" id="tab-fourier">
+          <button id="runAnalysis" class="primary">Analyze selection</button>
+          <div id="analysis" hidden>
+            <div class="grid2">
+              <div><h4>Average spectrum</h4><canvas id="specChart" height="220"></canvas></div>
+              <div><h4>Harmonic profile (first 64)</h4><canvas id="harmChart" height="220"></canvas></div>
+            </div>
+            <div class="grid3">
+              <div><h4>Envelope</h4><div id="envInfo" class="kv"></div></div>
+              <div><h4>Modulation (LFO)</h4><div id="lfoInfo" class="kv"></div></div>
+              <div><h4>Character</h4><div id="charInfo" class="kv"></div></div>
+            </div>
+            <h4>Notes &amp; timing</h4>
+            <table class="notes"><thead><tr><th>#</th><th>start (s)</th><th>grid</th><th>offset</th><th>length</th><th>pitch</th><th>bend</th></tr></thead><tbody id="notesBody"></tbody></table>
+          </div>
+        </div>
+
+        <div class="tabpane" id="tab-recon" hidden>
+          <div class="recon-opts">
+            <div class="opt">
+              <label>Target accuracy <b id="targetVal">90</b>%</label>
+              <input id="target" type="range" min="50" max="99" value="90">
+              <div class="muted small">Lower = simpler patch with basic/stock waves. Higher = may need custom wavetables.</div>
+            </div>
+            <div class="opt">
+              <label>Search time</label>
+              <select id="budget"><option value="90">1.5 min</option><option value="240" selected>4 min</option><option value="480">8 min</option><option value="900">15 min</option></select>
+            </div>
+            <div class="opt checks">
+              <label class="check"><input id="allowCustom" type="checkbox" checked> allow custom wavetables if needed</label>
+              <label class="check"><input id="stockOnly" type="checkbox"> only Serum stock tables (no generated basics)</label>
+              <label class="check"><input id="verifySerum" type="checkbox" checked> verify in real Serum 2</label>
+            </div>
+            <button id="runRecon" class="primary">Reconstruct</button>
+          </div>
+          <div id="result" hidden>
+            <div class="score-row">
+              <div class="score"><div id="accVal" class="big">–</div><div class="muted">accuracy</div></div>
+              <div class="score-detail">
+                <div id="accBadge" class="badge"></div>
+                <div id="accBars" class="bars"></div>
+                <div id="serumScore" class="muted small"></div>
+              </div>
+            </div>
+            <div class="ab">
+              <div><h4>Original</h4><audio id="aTarget" controls></audio></div>
+              <div><h4>Reconstruction</h4><audio id="aRender" controls></audio></div>
+              <div id="serumAB" hidden><h4>Real Serum 2</h4><audio id="aSerum" controls></audio></div>
+            </div>
+            <div class="actions">
+              <button id="installBtn" class="primary">Install preset into Serum 2</button>
+              <a id="dlPreset" class="btn">Download .SerumPreset</a>
+              <a id="dlMidi" class="btn">Download MIDI</a>
+              <a id="dlRender" class="btn ghost">Render .wav</a>
+              <button id="revealBtn" class="ghost">Show files</button>
+            </div>
+            <div class="grid2">
+              <div><h4>Patch</h4><ul id="patchDesc" class="desc"></ul></div>
+              <div><h4>How it got there</h4><ol id="stages" class="desc"></ol><h4>Verification checks</h4><ul id="checks" class="desc"></ul></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" id="resultsCard" hidden>
+        <h3>Previous reconstructions</h3>
+        <ul id="pastResults" class="desc"></ul>
+      </div>
+    </section>
+  </main>
+</div>
+
+<dialog id="settings">
+  <form method="dialog">
+    <h3>Settings</h3>
+    <div class="kv" id="sysInfo"></div>
+    <label>Update channel
+      <select id="setChannel"><option value="release">Releases (recommended)</option></select>
+    </label>
+    <label class="check"><input id="setAuto" type="checkbox"> install updates automatically on launch</label>
+    <label>Serum tables folder (blank = auto)<input id="setTables" type="text" placeholder="~/Documents/Xfer/Serum 2 Presets/Tables"></label>
+    <label>Serum 2 plugin path (blank = auto)<input id="setPlugin" type="text" placeholder="/Library/Audio/Plug-Ins/Components/Serum2.component"></label>
+    <div class="row">
+      <button id="calibrateBtn" type="button" class="ghost">Calibrate with Serum 2</button>
+      <span class="muted small">Measures Serum's filter-cutoff curve so presets match exactly.</span>
+    </div>
+    <menu><button value="cancel" class="ghost">Close</button><button id="saveSettings" value="save" class="primary">Save</button></menu>
+  </form>
+</dialog>
+
+<audio id="player"></audio>
+<script src="/static/app.js"></script>
+</body>
+</html>

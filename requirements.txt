@@ -1,0 +1,24 @@
+# Runtime dependencies (installed into the app's private venv by installer/install.sh).
+# The updater re-installs this file whenever it changes.
+numpy>=2.0
+scipy>=1.13
+librosa>=0.10.2
+soundfile>=0.12
+scikit-learn>=1.3
+numba>=0.60
+cbor2>=5.6
+zstandard>=0.22
+cma>=3.3
+mido>=1.3
+certifi
+fastapi>=0.110
+uvicorn>=0.29
+python-multipart>=0.0.9
+pillow>=10.0
+imageio-ffmpeg>=0.5
+# source separation (Demucs v4 + MDX23C DrumSep) - pulls in torch with Apple-GPU (MPS) support
+audio-separator>=0.30
+# hosting the real Serum 2 plugin for verification/calibration
+pedalboard>=0.9.14
+# native window
+pywebview>=5.0; sys_platform == "darwin"

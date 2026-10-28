@@ -1,0 +1,201 @@
+"""Host the real Serum 2 plugin (macOS) to verify and calibrate patches.
+
+Uses Spotify's ``pedalboard`` to load Serum 2 (AU or VST3), injects our
+preset into the plugin state, renders the detected MIDI notes and scores the
+result against the original. Serum keeps its preset inside the plugin state
+blob (the same ``XferJson`` container as .SerumPreset files), so we locate
+that container inside ``raw_state`` and swap it for ours. Everything is
+best-effort and reports clearly when it cannot work.
+"""
+from __future__ import annotations
+
+import base64
+import logging
+import plistlib
+import struct
+from pathlib import Path
+
+import numpy as np
+
+from .. import config
+from ..export import BEND_RANGE
+from .preset import MAGIC
+
+log = logging.getLogger(__name__)
+
+
+class SerumHostError(RuntimeError):
+    pass
+
+
+def _preset_len(blob: bytes, start: int) -> int:
+    """Length of an XferJson container starting at ``start`` in blob."""
+    import zstandard
+    pos = start + len(MAGIC)
+    (jlen,) = struct.unpack_from("<Q", blob, pos)
+    pos += 8 + jlen
+    pos += 8   # uncompressed size + version
+    d = zstandard.ZstdDecompressor().decompressobj()
+    d.decompress(blob[pos:])
+    unused = len(d.unused_data) if hasattr(d, "unused_data") else 0
+    return (len(blob) - unused) - start
+
+
+def _swap(blob: bytes, preset: bytes) -> bytes | None:
+    k = blob.find(MAGIC)
+    if k < 0:
+        return None
+    old_len = _preset_len(blob, k)
+    new = blob[:k] + preset + blob[k + old_len:]
+    # fix a length prefix just before the container, if there is one
+    for fmt, size in (("<Q", 8), ("<I", 4), (">I", 4)):
+        if k >= size:
+            (v,) = struct.unpack_from(fmt, blob, k - size)
+            if v == old_len:
+                new = new[:k - size] + struct.pack(fmt, len(preset)) + new[k:]
+                break
+            if v == len(blob) - k:
+                new = new[:k - size] + struct.pack(fmt, len(new) - k) + new[k:]
+                break
+    return new
+
+
+def _swap_in_state(state: bytes, preset: bytes) -> bytes | None:
+    """Handle raw blobs, AU plists and base64-in-plist variants."""
+    direct = _swap(state, preset)
+    if direct is not None:
+        return direct
+    try:
+        pl = plistlib.loads(state)
+    except Exception:
+        return None
+
+    def walk(obj):
+        if isinstance(obj, (bytes, bytearray)):
+            r = _swap(bytes(obj), preset)
+            return (r, True) if r is not None else (obj, False)
+        if isinstance(obj, str) and len(obj) > 64:
+            try:
+                raw = base64.b64decode(obj, validate=True)
+            except Exception:
+                return obj, False
+            r = _swap(raw, preset)
+            return (base64.b64encode(r).decode(), True) if r is not None else (obj, False)
+        if isinstance(obj, dict):
+            hit = False
+            for kk in list(obj):
+                obj[kk], h = walk(obj[kk])
+                hit |= h
+            return obj, hit
+        if isinstance(obj, list):
+            hit = False
+            for i, v in enumerate(obj):
+                obj[i], h = walk(v)
+                hit |= h
+            return obj, hit
+        return obj, False
+
+    pl, hit = walk(pl)
+    if not hit:
+        return None
+    return plistlib.dumps(pl, fmt=plistlib.FMT_BINARY)
+
+
+class SerumHost:
+    def __init__(self, plugin_path: str | Path | None = None, sr: int = 44100):
+        self.path = Path(plugin_path) if plugin_path else config.serum_plugin_path()
+        if not self.path:
+            raise SerumHostError("Serum 2 plugin not found (looked for Serum2.component / Serum2.vst3)")
+        try:
+            import pedalboard
+        except Exception as e:
+            raise SerumHostError(f"pedalboard not installed: {e}")
+        self.sr = sr
+        try:
+            self.plugin = pedalboard.load_plugin(str(self.path), plugin_name="Serum 2")
+        except Exception:
+            self.plugin = pedalboard.load_plugin(str(self.path))
+        self.base_state = bytes(self.plugin.raw_state)
+
+    def load_preset(self, preset: bytes) -> None:
+        new = _swap_in_state(self.base_state, preset)
+        if new is None:
+            raise SerumHostError("could not find Serum's preset container in the plugin state "
+                                 f"({len(self.base_state)} bytes); format may have changed")
+        self.plugin.raw_state = new
+
+    def render(self, notes, duration: float) -> np.ndarray:
+        import mido
+        msgs = []
+        for n in notes:
+            p = int(round(n.pitch))
+            v = int(np.clip(round(n.velocity * 127), 1, 127))
+            msgs.append(mido.Message("note_on", note=p, velocity=v, time=float(n.start)))
+            msgs.append(mido.Message("note_off", note=p, velocity=0, time=float(n.start + n.duration)))
+            if n.bend:
+                for t, semis in n.bend:
+                    val = int(np.clip(semis / BEND_RANGE * 8191, -8192, 8191))
+                    msgs.append(mido.Message("pitchwheel", pitch=val, time=float(n.start + t)))
+        msgs.sort(key=lambda m: m.time)
+        out = self.plugin(msgs, duration=duration + 0.5, sample_rate=self.sr, num_channels=2,
+                          buffer_size=512, reset=True)
+        y = np.asarray(out, dtype=np.float32)
+        if y.ndim == 2:
+            y = y.mean(axis=0)
+        return y[: int(duration * self.sr)]
+
+
+def verify(preset: bytes, notes, y_target: np.ndarray, sr: int) -> dict:
+    """Render the preset in real Serum and score it. Never raises."""
+    try:
+        host = SerumHost(sr=44100)
+        host.load_preset(preset)
+        y = host.render(notes, len(y_target) / sr)
+        if not np.any(np.abs(y) > 1e-5):
+            return {"ok": False, "error": "Serum rendered silence (preset not accepted?)"}
+        from ..audio import resample
+        from ..match.score import Target
+        yt = resample(y_target, sr, 22050)
+        yr = resample(y, 44100, 22050)
+        s, d = Target(yt, 22050).score(yr, detail=True)
+        return {"ok": True, "score": round(float(s), 2), "details": d, "audio": y}
+    except Exception as e:
+        log.warning("Serum verification unavailable: %s", e)
+        return {"ok": False, "error": str(e)}
+
+
+def calibrate_cutoff(progress=None) -> dict:
+    """Measure Serum's cutoff curve: render white noise through L12 at several
+    kParamFreq values, find the -3 dB point and fit the exponential map."""
+    from ..synth.patch import Filter, Note, NoiseOsc, Osc, Patch
+    from .mapping import patch_to_state
+    from .preset import write_preset_bytes
+    host = SerumHost()
+    xs, fs = [], []
+    for x in np.linspace(0.3, 0.85, 6):
+        p = Patch()
+        p.oscs[0] = Osc(enabled=False)
+        p.noise = NoiseOsc(enabled=True, color=0.5, level=1.0)
+        p.filter = Filter(enabled=True, type="lp12", cutoff=1000)
+        st = patch_to_state(p)
+        st["VoiceFilter0"]["plainParams"]["kParamFreq"] = float(x)
+        host.load_preset(write_preset_bytes(st, "cal"))
+        y = host.render([Note(0, 2.0, 60)], 2.0)
+        spec = np.abs(np.fft.rfft(y[4410:] * np.hanning(len(y) - 4410))) ** 2
+        fr = np.fft.rfftfreq(len(y) - 4410, 1 / 44100)
+        sm = np.convolve(spec, np.ones(200) / 200, mode="same")
+        ref = np.median(sm[(fr > 40) & (fr < 80)])
+        below = np.nonzero((fr > 50) & (sm < ref * 0.5))[0]
+        if len(below):
+            xs.append(x)
+            fs.append(fr[below[0]])
+        if progress:
+            progress(f"cutoff {x:.2f} -> {fs[-1] if fs else '?'} Hz")
+    if len(xs) < 3:
+        raise SerumHostError("calibration failed")
+    k, c = np.polyfit(xs, np.log(fs), 1)
+    lo, hi = float(np.exp(c)), float(np.exp(c + k))
+    s = config.settings().get("serum_scales", {})
+    s.update({"cutoff_lo_hz": lo, "cutoff_hi_hz": hi})
+    config.save_settings(serum_scales=s)
+    return {"cutoff_lo_hz": lo, "cutoff_hi_hz": hi, "points": list(zip(xs, fs))}

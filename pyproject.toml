@@ -1,0 +1,21 @@
+[project]
+name = "fourier-analyzer"
+dynamic = ["version"]
+description = "Split songs into stems, analyse a sound with Fourier analysis and rebuild it as a Serum 2 patch."
+requires-python = ">=3.11"
+readme = "README.md"
+
+[project.scripts]
+fourier-analyzer = "fourier_analyzer.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["fourier_analyzer*"]
+
+[tool.setuptools.package-data]
+fourier_analyzer = ["serum/*.json", "app/static/*"]
+
+[tool.setuptools.dynamic]
+version = {file = "VERSION"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

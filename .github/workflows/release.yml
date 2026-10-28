@@ -1,0 +1,47 @@
+name: release
+# Every push to the default branch publishes a new release. The app's updater
+# and the installer both pull the "latest" release, so merging = shipping.
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: release
+  cancel-in-progress: false
+jobs:
+  release:
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: sudo apt-get update && sudo apt-get install -y libsndfile1
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest -q
+      - name: Version
+        id: v
+        run: |
+          base=$(cut -d. -f1,2 VERSION)
+          echo "version=${base}.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+      - name: Build archive
+        run: |
+          echo "${{ steps.v.outputs.version }}" > VERSION
+          echo "${{ github.sha }}" > COMMIT
+          mkdir -p dist
+          tar --exclude=.git --exclude=dist --exclude=tests -czf dist/fourier-analyzer.tar.gz \
+            VERSION COMMIT README.md requirements.txt pyproject.toml fourier_analyzer installer
+          cp installer/install.sh dist/install.sh
+          cp "installer/Install Fourier Analyzer.command" "dist/Install-Fourier-Analyzer.command"
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${{ steps.v.outputs.version }}"
+          notes=$(git log -1 --pretty=%B | head -c 3000)
+          gh release create "v$v" dist/fourier-analyzer.tar.gz dist/install.sh dist/Install-Fourier-Analyzer.command \
+            --title "Fourier Analyzer $v" --notes "$notes" --target "${{ github.sha }}" --latest
