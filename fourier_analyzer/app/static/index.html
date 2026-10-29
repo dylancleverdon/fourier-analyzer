@@ -87,13 +87,21 @@
           <div class="ed-tools">
             <span id="playTime" class="mono"></span>
             <span id="selInfo" class="muted mono"></span>
+            <span class="zoom">
+              <button id="zoomOut" class="ghost" title="Zoom out (-)">−</button>
+              <button id="zoomIn" class="ghost" title="Zoom in (+)">+</button>
+              <button id="zoomSel" class="ghost" title="Zoom to selection (Z)">Zoom to selection</button>
+              <button id="zoomFit" class="ghost" title="Show everything (0)">Fit</button>
+            </span>
             <button id="playSel">▶ Play selection</button>
             <button id="clearSel" class="ghost">Clear</button>
             <button id="splitBtn" class="ghost" title="Separate stacked layers inside this stem">Split layers…</button>
           </div>
         </div>
-        <canvas id="wave" height="140"></canvas>
-        <div class="muted small hint">Drag to select · click to play from a point · space = play/pause</div>
+        <canvas id="wave" height="160"></canvas>
+        <canvas id="waveOverview" height="30" title="Overview: drag the box to move around"></canvas>
+        <div class="muted small hint">Drag to select · click to play from a point · space = play/pause ·
+          ⌘/Ctrl + scroll or pinch = zoom · Shift + scroll or swipe sideways = move · + / − / 0 / Z keys</div>
         <img id="spec" alt="spectrogram" hidden>
         <div class="tabs">
           <button class="tab active" data-tab="fourier">Fourier analysis</button>

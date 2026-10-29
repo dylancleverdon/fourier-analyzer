@@ -199,13 +199,37 @@ def stem_audio(pid: str, stem: str):
 
 
 @app.get("/api/projects/{pid}/peaks/{stem}")
-def stem_peaks(pid: str, stem: str, n: int = 1600):
-    y, sr = audio.load(_stem_path(pid, stem), sr=22050, mono=True)
-    n = max(100, min(n, 6000))
-    hop = max(1, len(y) // n)
-    m = len(y) // hop
-    fr = np.abs(y[: m * hop]).reshape(m, hop)
-    return {"duration": len(y) / sr, "peaks": fr.max(1).round(4).tolist()}
+def stem_peaks(pid: str, stem: str, n: int = 1600, start: float | None = None, end: float | None = None):
+    """Waveform overview. With start/end only that window is returned (for
+    zooming), with signed min/max per column so single cycles are visible."""
+    y, sr = _load_cached(_stem_path(pid, stem))
+    dur = len(y) / sr
+    n = max(50, min(n, 8000))
+    a = int(max(0.0, start or 0.0) * sr)
+    b = int(min(dur, end if end else dur) * sr)
+    seg = y[a:max(b, a + 1)]
+    if len(seg) <= n:          # fewer samples than columns: return samples
+        return {"duration": dur, "start": a / sr, "end": b / sr, "peaks": np.abs(seg).round(4).tolist(),
+                "mins": seg.round(4).tolist(), "maxs": seg.round(4).tolist()}
+    edges = np.linspace(0, len(seg), n + 1).astype(int)
+    mx = np.maximum.reduceat(seg, edges[:-1])
+    mn = np.minimum.reduceat(seg, edges[:-1])
+    return {"duration": dur, "start": a / sr, "end": b / sr,
+            "peaks": np.maximum(np.abs(mx), np.abs(mn)).round(4).tolist(),
+            "mins": mn.round(4).tolist(), "maxs": mx.round(4).tolist()}
+
+
+_audio_cache: dict = {}
+
+
+def _load_cached(path: Path):
+    """Zooming fetches many windows; keep the last few stems decoded."""
+    key = (str(path), path.stat().st_mtime)
+    if key not in _audio_cache:
+        if len(_audio_cache) > 6:
+            _audio_cache.pop(next(iter(_audio_cache)))
+        _audio_cache[key] = audio.load(path, sr=22050, mono=True)
+    return _audio_cache[key]
 
 
 @app.get("/api/projects/{pid}/spectrogram/{stem}")

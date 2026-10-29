@@ -227,8 +227,9 @@ async function selectStem(name) {
   renderStems();
   $("#editor").hidden = false;
   $("#edTitle").textContent = `${name} — ${name === "mix" ? "full mix" : stemLabel(name)}`;
-  const p = await api(`/api/projects/${state.pid}/peaks/${name}?n=2400`);
+  const p = await api(`/api/projects/${state.pid}/peaks/${name}?n=4000`);
   state.peaks = p.peaks; state.duration = p.duration;
+  state.view = [0, p.duration]; state.viewData = null;
   drawWave(); updateSelInfo(); $("#spec").hidden = true;
   $("#editor").scrollIntoView({ behavior: "smooth", block: "start" });
 }
@@ -259,17 +260,133 @@ function drawPeaks(cv, peaks, sel, dur, head = null) {
     g.beginPath(); g.moveTo(x - 5, 0); g.lineTo(x + 5, 0); g.lineTo(x, 7); g.closePath(); g.fill();
   }
 }
-function drawWave() { drawPeaks($("#wave"), state.peaks, state.sel, state.duration, headTime(state.stem)); }
+
+// ---------------------------------------------------------------- zoomable editor
+const MIN_VIEW = 0.005;           // seconds visible at maximum zoom
+function view() { return state.view || [0, state.duration || 1]; }
+function setView(a, b) {
+  const D = state.duration || 1;
+  let w = Math.max(MIN_VIEW, Math.min(D, b - a));
+  a = Math.max(0, Math.min(D - w, a));
+  state.view = [a, a + w];
+  drawWave();
+  fetchViewPeaks();
+}
+function zoomBy(f, center) {
+  const [a, b] = view();
+  const c = center == null ? (a + b) / 2 : center;
+  setView(c - (c - a) * f, c + (b - c) * f);
+}
+let _vpTimer = null;
+function fetchViewPeaks() {
+  clearTimeout(_vpTimer);
+  const [a, b] = view();
+  if (a <= 0 && b >= state.duration - 1e-6) { state.viewData = null; return; }
+  _vpTimer = setTimeout(async () => {
+    const cv = $("#wave"); const stem = state.stem;
+    const p = await api(`/api/projects/${state.pid}/peaks/${stem}?start=${a}&end=${b}&n=${Math.round(cv.clientWidth * 1.5)}`);
+    const [a2, b2] = view();
+    if (stem === state.stem && Math.abs(a2 - a) < 1e-9 && Math.abs(b2 - b) < 1e-9) { state.viewData = p; drawWave(); }
+  }, 60);
+}
+function niceStep(span, px) {
+  const target = span / Math.max(1, px / 90);
+  const p = Math.pow(10, Math.floor(Math.log10(target)));
+  for (const m of [1, 2, 5, 10]) if (m * p >= target) return m * p;
+  return 10 * p;
+}
+function fmtT(t, step) {
+  const d = step >= 1 ? 0 : step >= 0.1 ? 1 : step >= 0.01 ? 2 : 3;
+  return t >= 60 ? `${Math.floor(t / 60)}:${(t % 60).toFixed(d).padStart(d ? 3 + d : 2, "0")}` : t.toFixed(d) + "s";
+}
+function drawWave() {
+  const cv = $("#wave"); if (!cv || !state.peaks) return;
+  const dpr = window.devicePixelRatio || 1, w = cv.clientWidth, h = cv.clientHeight;
+  cv.width = w * dpr; cv.height = h * dpr;
+  const g = cv.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, w, h);
+  const [a, b] = view(), span = b - a, D = state.duration;
+  const X = (t) => ((t - a) / span) * w;
+  const top = 16, mid = top + (h - top) / 2, amp = (h - top) / 2 - 2;
+  // beat / bar grid
+  const bpm = parseFloat($("#bpm").value) || state.meta.bpm;
+  if (bpm) {
+    const beat = 60 / bpm;
+    if (span / beat < w / 6) {
+      for (let k = Math.floor(a / beat); k * beat <= b; k++) {
+        g.fillStyle = k % 4 === 0 ? "#2b303c" : "#1a1e26";
+        g.fillRect(Math.round(X(k * beat)), top, 1, h - top);
+        if (k % 4 === 0 && span / beat < w / 25) { g.fillStyle = "#5b6475"; g.font = "9px -apple-system"; g.fillText(`bar ${k / 4 + 1}`, X(k * beat) + 3, h - 4); }
+      }
+    }
+  }
+  // time ruler
+  const step = niceStep(span, w);
+  g.fillStyle = "#8a92a6"; g.font = "10px -apple-system";
+  for (let t = Math.ceil(a / step) * step; t <= b; t += step) {
+    const x = Math.round(X(t)); g.fillRect(x, 0, 1, 5); g.fillText(fmtT(t, step), x + 3, 10);
+  }
+  // selection
+  if (state.sel) { g.fillStyle = "rgba(255,138,61,.22)"; g.fillRect(X(state.sel[0]), top, X(state.sel[1]) - X(state.sel[0]), h - top); }
+  // waveform: zoomed data (signed min/max) when available, else the overview peaks
+  const max = Math.max(1e-6, ...state.peaks);
+  g.fillStyle = "#b06cff";
+  const vd = state.viewData;
+  if (vd && Math.abs(vd.start - a) < 1e-3 && Math.abs(vd.end - b) < 1e-3 && vd.mins) {
+    const n = vd.mins.length;
+    if (n < w / 2) {   // very deep zoom: draw the actual signal as a line
+      g.strokeStyle = "#b06cff"; g.lineWidth = 1.5; g.beginPath();
+      vd.maxs.forEach((v, i) => { const x = (i + 0.5) / n * w, y = mid - (v / max) * amp; i ? g.lineTo(x, y) : g.moveTo(x, y); });
+      g.stroke();
+    } else {
+      for (let x = 0; x < w; x++) {
+        const i0 = Math.floor(x / w * n), i1 = Math.max(i0 + 1, Math.floor((x + 1) / w * n));
+        let lo = 0, hi = 0;
+        for (let i = i0; i < i1; i++) { lo = Math.min(lo, vd.mins[i]); hi = Math.max(hi, vd.maxs[i]); }
+        const y0 = mid - (hi / max) * amp, y1 = mid - (lo / max) * amp;
+        g.fillRect(x, y0, 1, Math.max(1, y1 - y0));
+      }
+    }
+  } else {
+    const P = state.peaks, n = P.length;
+    for (let x = 0; x < w; x++) {
+      const t0 = a + (x / w) * span, t1 = a + ((x + 1) / w) * span;
+      const i0 = Math.floor((t0 / D) * n), i1 = Math.max(i0 + 1, Math.ceil((t1 / D) * n));
+      let m = 0; for (let i = i0; i < i1 && i < n; i++) m = Math.max(m, P[i]);
+      const v = (m / max) * amp; g.fillRect(x, mid - v, 1, Math.max(1, v * 2));
+    }
+  }
+  // playhead (+ follow it while playing)
+  const head = headTime(state.stem);
+  if (head != null) {
+    if (!player.paused && (head > b || head < a) && span < D) { setView(head - span * 0.05, head + span * 0.95); return; }
+    const x = Math.round(X(head)) + 0.5;
+    g.strokeStyle = "#ffffff"; g.lineWidth = 1.5; g.beginPath(); g.moveTo(x, top); g.lineTo(x, h); g.stroke();
+    g.fillStyle = "#ffffff"; g.beginPath(); g.moveTo(x - 5, top); g.lineTo(x + 5, top); g.lineTo(x, top + 7); g.closePath(); g.fill();
+  }
+  drawOverview();
+  $("#zoomSel").disabled = !state.sel;
+}
+function drawOverview() {
+  const cv = $("#waveOverview"); if (!cv || !state.peaks) return;
+  const [a, b] = view(), D = state.duration || 1;
+  drawPeaks(cv, state.peaks, state.sel, D, headTime(state.stem));
+  const g = cv.getContext("2d"), w = cv.clientWidth, h = cv.clientHeight;
+  if (b - a < D - 1e-6) {
+    g.fillStyle = "rgba(0,0,0,.55)";
+    g.fillRect(0, 0, (a / D) * w, h); g.fillRect((b / D) * w, 0, w - (b / D) * w, h);
+    g.strokeStyle = "#ffffff"; g.lineWidth = 1; g.strokeRect((a / D) * w + 0.5, 0.5, ((b - a) / D) * w - 1, h - 1);
+  }
+}
 
 (function setupSelection() {
-  const cv = $("#wave"); let dragging = false, x0 = 0;
-  const t = (e) => Math.max(0, Math.min(state.duration, ((e.clientX - cv.getBoundingClientRect().left) / cv.clientWidth) * state.duration));
+  const cv = $("#wave"); let dragging = false, x0 = 0, px0 = 0;
+  const t = (e) => { const [a, b] = view(); return Math.max(0, Math.min(state.duration, a + ((e.clientX - cv.getBoundingClientRect().left) / cv.clientWidth) * (b - a))); };
   let prevSel = null;
-  cv.addEventListener("mousedown", (e) => { dragging = true; x0 = t(e); prevSel = state.sel; state.sel = [x0, x0]; drawWave(); });
+  cv.addEventListener("mousedown", (e) => { dragging = true; x0 = t(e); px0 = e.clientX; prevSel = state.sel; state.sel = [x0, x0]; drawWave(); });
   window.addEventListener("mousemove", (e) => { if (!dragging) return; const x = t(e); state.sel = [Math.min(x0, x), Math.max(x0, x)]; drawWave(); updateSelInfo(); });
-  window.addEventListener("mouseup", () => {
+  window.addEventListener("mouseup", (e) => {
     if (!dragging) return; dragging = false;
-    if (state.sel && state.sel[1] - state.sel[0] < 0.05) {
+    if (Math.abs(e.clientX - px0) < 4) {
       // a click (not a drag) moves the playhead and plays from there
       state.sel = prevSel;
       drawWave(); updateSelInfo();
@@ -278,7 +395,40 @@ function drawWave() { drawPeaks($("#wave"), state.peaks, state.sel, state.durati
     }
     drawWave(); updateSelInfo(); loadSpectrogram();
   });
+  // zoom: ctrl/cmd + wheel (trackpad pinch sends ctrl+wheel); pan: horizontal / shift + wheel
+  cv.addEventListener("wheel", (e) => {
+    const [a, b] = view(), span = b - a;
+    if (e.ctrlKey || e.metaKey) {
+      e.preventDefault();
+      zoomBy(Math.exp(e.deltaY * 0.01), t(e));
+    } else if (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+      e.preventDefault();
+      const d = (e.shiftKey ? e.deltaY : e.deltaX) / cv.clientWidth * span;
+      setView(a + d, b + d);
+    }
+  }, { passive: false });
+  // overview: drag the box to pan, click elsewhere to centre there
+  const ov = $("#waveOverview"); let ovDrag = false, ovOff = 0;
+  const ovT = (e) => ((e.clientX - ov.getBoundingClientRect().left) / ov.clientWidth) * state.duration;
+  ov.addEventListener("mousedown", (e) => {
+    const [a, b] = view(), tt = ovT(e);
+    ovDrag = true; ovOff = tt >= a && tt <= b ? tt - a : (b - a) / 2;
+    setView(tt - ovOff, tt - ovOff + (b - a));
+  });
+  window.addEventListener("mousemove", (e) => { if (!ovDrag) return; const [a, b] = view(); const tt = ovT(e); setView(tt - ovOff, tt - ovOff + (b - a)); });
+  window.addEventListener("mouseup", () => { ovDrag = false; });
 })();
+$("#zoomIn").onclick = () => zoomBy(0.5, headTime(state.stem));
+$("#zoomOut").onclick = () => zoomBy(2);
+$("#zoomFit").onclick = () => setView(0, state.duration);
+$("#zoomSel").onclick = () => { if (state.sel) { const pad = (state.sel[1] - state.sel[0]) * 0.08; setView(state.sel[0] - pad, state.sel[1] + pad); } };
+document.addEventListener("keydown", (e) => {
+  if (!state.peaks || $("#editor").hidden || /INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName) || e.metaKey || e.ctrlKey) return;
+  if (e.key === "+" || e.key === "=") zoomBy(0.5);
+  else if (e.key === "-" || e.key === "_") zoomBy(2);
+  else if (e.key === "0") setView(0, state.duration);
+  else if (e.key === "z" || e.key === "Z") $("#zoomSel").click();
+});
 
 function selRange() { return state.sel ? { start: +state.sel[0].toFixed(4), end: +state.sel[1].toFixed(4) } : { start: null, end: null }; }
 function updateSelInfo() {
