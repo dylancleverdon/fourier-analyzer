@@ -37,6 +37,15 @@ from .score import Target
 log = logging.getLogger(__name__)
 
 OPT_SR = 22050
+STAGE_TEXT = {
+    "init": "Initial guess from Fourier analysis",
+    "tables": "Wavetable search (basic shapes first, then Serum stock tables)",
+    "structure": "Structure search: trying to add noise / unison / LFOs / FX one at a time",
+    "prune": "Pruning: removing components that don't improve the match",
+    "fine-tune": "Fine-tuning every parameter together (CMA-ES)",
+    "custom": "Custom wavetable from the measured harmonics",
+    "final": "Final scoring",
+}
 MAX_OPT_SECONDS = 6.0
 
 
@@ -83,6 +92,11 @@ class Optimizer:
         self.t0 = time.time()
         self.best_score = -1.0
         self.evals = 0
+        self.stage = "init"
+        self.activity = ""
+        self._stage_t0 = self.t0
+        self._stage_evals = 0
+        self._last_beat = 0.0
         self.history: list = []
         self.stages: list = []
 
@@ -90,11 +104,32 @@ class Optimizer:
     def time_left(self) -> float:
         return self.opts.time_budget - (time.time() - self.t0)
 
+    def set_stage(self, stage: str, activity: str = ""):
+        if stage != self.stage:
+            self.stage, self._stage_t0, self._stage_evals = stage, time.time(), self.evals
+        self.activity = activity
+        self.report(stage)
+
+    def status(self) -> dict:
+        now = time.time()
+        st_el = max(now - self._stage_t0, 1e-6)
+        n = self.evals - self._stage_evals
+        return {"stage": self.stage, "stage_text": STAGE_TEXT.get(self.stage, self.stage),
+                "activity": self.activity, "evals": self.evals, "stage_evals": n,
+                "rate": round(n / st_el, 1), "stage_elapsed": round(st_el, 1),
+                "elapsed": round(now - self.t0, 1), "budget": self.opts.time_budget,
+                "best": round(self.best_score, 2)}
+
     def report(self, stage: str, msg: str = ""):
         frac = min(1.0, (time.time() - self.t0) / max(self.opts.time_budget, 1))
+        self._last_beat = time.time()
         if self.progress_cb:
-            self.progress_cb(stage, frac, self.best_score, msg)
-        log.info("[%s] %.1f %s", stage, self.best_score, msg)
+            try:
+                self.progress_cb(stage, frac, self.best_score, msg, self.status())
+            except TypeError:       # older 4-argument callbacks
+                self.progress_cb(stage, frac, self.best_score, msg)
+        if msg:
+            log.info("[%s] %.1f %s", stage, self.best_score, msg)
 
     def evaluate(self, patch: Patch) -> float:
         self.evals += 1
@@ -108,6 +143,8 @@ class Optimizer:
         s = self.target.score(y)
         if s > self.best_score:
             self.best_score = s
+        if time.time() - self._last_beat > 1.0:      # live heartbeat for the UI
+            self.report(self.stage)
         return s
 
     # ------------------------------------------------------------------
@@ -362,11 +399,13 @@ class Optimizer:
 
         # --- 2. table search -------------------------------------------------
         cands = self.table_candidates()
+        self.set_stage("tables", f"{len(cands)} candidate wavetables")
         results = []
         per = max(30, int(min(80, self.time_left() * 0.25 / max(1, len(cands)) / 0.03)))
         for tid, pos in cands:
             if self.time_left() < opts.time_budget * 0.6:
                 break
+            self.activity = f"tuning with {tid}"
             q = p.copy()
             q.oscs[0].table = tid
             q.oscs[0].position = float(pos)
@@ -386,11 +425,13 @@ class Optimizer:
             if added and self.accuracy(p, score) >= opts.target_score:
                 break
             moves = self.structure_moves(p)
+            self.set_stage("structure", f"screening {len(moves)} possible additions")
             # cheap screen: a short tune of only the new component's params
             screened = []
             for name, fn, focus in moves:
                 if self.time_left() < opts.time_budget * 0.3:
                     break
+                self.activity = f"screening: {name}"
                 q = fn(p.copy())
                 q, s = self.tune(q, 12, focus=focus, sigma=0.2)
                 screened.append((s, name, q, focus))
@@ -399,6 +440,7 @@ class Optimizer:
             for s0, name, q, focus in screened[:4]:
                 if self.time_left() < opts.time_budget * 0.3:
                     break
+                self.activity = f"testing best candidate: {name}"
                 q, s = self.tune(q, 48, focus=focus | {"filter", "osc", "env"}, sigma=0.1)
                 if s > best[0] + 0.25:
                     best = (s, name, q)
@@ -410,6 +452,7 @@ class Optimizer:
         self.stages.append({"stage": "structure search", "score": round(score, 2), "steps": added})
 
         # --- 4. pruning (ablation) ------------------------------------------
+        self.set_stage("prune", "removing components that do not help")
         removed = []
         changed = True
         while changed and self.time_left() > opts.time_budget * 0.15:
@@ -427,6 +470,7 @@ class Optimizer:
 
         # --- 5. fine-tune ----------------------------------------------------
         budget = int(max(40, self.time_left() * 0.6 / 0.03))
+        self.set_stage("fine-tune", f"all {len(P.continuous_params(p))} parameters together")
         p, score = self.tune(p, budget, sigma=0.08)
         self.report("fine-tune", f"{score:.1f}")
         self.stages.append({"stage": "fine-tune", "score": round(score, 2)})
@@ -434,6 +478,7 @@ class Optimizer:
         # --- 6. custom wavetable ---------------------------------------------
         used_custom = False
         if self.accuracy(p, score) < opts.target_score and opts.allow_custom and self.time_left() > 5:
+            self.set_stage("custom", "building a wavetable from the measured harmonics")
             q = self.custom_table_patch(p)
             if q is not None:
                 q, s = self.tune(q, int(max(30, self.time_left() * 0.9 / 0.03)), sigma=0.1)
@@ -442,6 +487,7 @@ class Optimizer:
                 if s > score + 0.5:
                     p, score, used_custom = q, s, True
 
+        self.set_stage("final", "measuring phase-noise ceiling")
         total, details = self.final_score(p)
         return Result(patch=p, score=total, details=details, notes=self.analysis.notes, bank=self.bank,
                       history=self.history, used_custom=used_custom, stages=self.stages)

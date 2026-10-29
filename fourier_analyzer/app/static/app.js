@@ -74,6 +74,20 @@ async function openProject(pid) {
   $("#projName").textContent = state.meta.name;
   $("#projInfo").textContent = `${fmt(state.meta.duration, 1)} s · ${state.meta.status}`;
   $("#bpm").value = state.meta.bpm || "";
+  renderBpmAlts();
+  if (!state.meta.bpm_candidates && state.meta.status === "ready") {
+    post(`/api/projects/${pid}/tempo`).then((t) => { state.meta.bpm = t.bpm; state.meta.bpm_candidates = t.candidates; $("#bpm").value = t.bpm; renderBpmAlts(); });
+  }
+  api(`/api/jobs?project=${pid}`).then((jobs) => jobs.forEach((j) => pollJob(j.id, () => openProject(pid)))).catch(() => {});
+  const st = state.meta.stems || {};
+  // older projects have no "separation" field: the DSP fallback never produces toms/ride/crash
+  const dsp = state.meta.separation === "dsp" || (!state.meta.separation && "drum_kick" in st && !("drum_toms" in st));
+  $("#dspWarn").hidden = !dsp || state.meta.status !== "ready";
+  $("#resepBtn").onclick = async () => {
+    $("#dspWarn").hidden = true;
+    const r = await post(`/api/projects/${pid}/separate`);
+    pollJob(r.job, () => openProject(pid));
+  };
   renderInstruments(); renderStems(); renderPastResults();
   document.querySelectorAll("#projects li").forEach((li) => li.classList.toggle("active", li.title === pid));
 }
@@ -104,10 +118,14 @@ function renderStems() {
     row.innerHTML = `<button class="iconbtn" title="Play">▶</button>
       <div><div class="name">${name}<small>${name === "mix" ? "full mix" : stemLabel(name)}</small></div><canvas></canvas></div>
       <div class="acts"><button class="ghost sel">Select</button><a class="btn ghost" href="/api/projects/${state.pid}/audio/${name}" download="${name}.wav">.wav</a></div>`;
-    row.querySelector(".iconbtn").onclick = (e) => { e.stopPropagation(); playStem(name, row.querySelector(".iconbtn")); };
+    row.querySelector(".iconbtn").onclick = (e) => { e.stopPropagation(); playStem(name); };
     row.querySelector(".sel").onclick = () => selectStem(name);
+    const cv = row.querySelector("canvas");
+    cv.dataset.stem = name;
+    cv.title = "Click to play from here";
+    cv.onclick = (e) => { const r = cv.getBoundingClientRect(); playFrom(name, ((e.clientX - r.left) / r.width) * (cv._dur || 0)); };
     box.appendChild(row);
-    api(`/api/projects/${state.pid}/peaks/${name}?n=600`).then((p) => drawPeaks(row.querySelector("canvas"), p.peaks, null));
+    api(`/api/projects/${state.pid}/peaks/${name}?n=600`).then((p) => { cv._peaks = p.peaks; cv._dur = p.duration; redrawRow(cv); });
   });
 }
 
@@ -130,16 +148,63 @@ function renderPastResults() {
   });
 }
 
-// ------------------------------------------------------------------ audio
+// ------------------------------------------------------------------ audio + playhead
 const player = $("#player");
-let playingBtn = null;
-function playStem(name, btn) {
-  const url = `/api/projects/${state.pid}/audio/${name}`;
-  if (playingBtn === btn && !player.paused) { player.pause(); btn.textContent = "▶"; return; }
-  if (playingBtn) playingBtn.textContent = "▶";
-  player.src = url; player.currentTime = 0; player.play(); btn.textContent = "❚❚"; playingBtn = btn;
-  player.onended = () => (btn.textContent = "▶");
+state.playStem = null;   // stem loaded in the player
+state.stopAt = null;     // end of selection playback
+function rowButton(name) {
+  const cv = document.querySelector(`#stems canvas[data-stem="${CSS.escape(name)}"]`);
+  return cv ? cv.closest(".stem").querySelector(".iconbtn") : null;
 }
+function syncButtons() {
+  document.querySelectorAll("#stems .iconbtn").forEach((b) => (b.textContent = "▶"));
+  const b = state.playStem && rowButton(state.playStem);
+  if (b && !player.paused) b.textContent = "❚❚";
+  $("#playSel").textContent = !player.paused && state.playStem === state.stem ? "❚❚ Pause" : "▶ Play selection";
+}
+function playFrom(name, t, stopAt = null) {
+  const go = () => { player.currentTime = Math.max(0, t || 0); state.stopAt = stopAt; player.play(); };
+  if (state.playStem !== name) {
+    state.playStem = name;
+    player.src = `/api/projects/${state.pid}/audio/${name}`;
+    player.addEventListener("loadedmetadata", go, { once: true });
+  } else go();
+}
+function playStem(name) {
+  if (state.playStem === name && !player.paused) { player.pause(); return; }
+  const resume = state.playStem === name && player.currentTime > 0 && player.currentTime < (player.duration || 1e9) - 0.05;
+  playFrom(name, resume ? player.currentTime : 0);
+}
+function headTime(name) { return state.playStem === name ? player.currentTime : null; }
+function redrawRow(cv) {
+  if (cv._peaks) drawPeaks(cv, cv._peaks, null, cv._dur, headTime(cv.dataset.stem));
+}
+function redrawHeads() {
+  if (!state.playStem) return;
+  const cv = document.querySelector(`#stems canvas[data-stem="${CSS.escape(state.playStem)}"]`);
+  if (cv) redrawRow(cv);
+  if (state.peaks && state.playStem === state.stem) drawWave();
+  const pt = $("#playTime");
+  if (pt) pt.textContent = state.playStem === state.stem ? `${fmt(player.currentTime, 2)} s` : "";
+}
+(function headLoop() {
+  if (!player.paused) {
+    if (state.stopAt != null && player.currentTime >= state.stopAt) { player.pause(); player.currentTime = state.stopAt; state.stopAt = null; }
+    redrawHeads();
+  }
+  requestAnimationFrame(headLoop);
+})();
+["play", "pause", "ended", "seeked"].forEach((ev) => player.addEventListener(ev, () => { syncButtons(); redrawHeads(); }));
+document.addEventListener("keydown", (e) => {
+  if (e.code !== "Space" || /INPUT|SELECT|TEXTAREA|BUTTON/.test(document.activeElement.tagName)) return;
+  e.preventDefault();
+  if (!player.paused) { player.pause(); return; }
+  const name = state.stem || state.playStem;
+  if (!name) return;
+  if (state.playStem === name && player.currentTime > 0) player.play();
+  else if (state.sel) playFrom(name, state.sel[0], state.sel[1]);
+  else playFrom(name, 0);
+});
 
 // ------------------------------------------------------------------ waveform editor
 async function selectStem(name) {
@@ -153,7 +218,7 @@ async function selectStem(name) {
   $("#editor").scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
-function drawPeaks(cv, peaks, sel, dur) {
+function drawPeaks(cv, peaks, sel, dur, head = null) {
   const dpr = window.devicePixelRatio || 1;
   const w = cv.clientWidth, h = cv.clientHeight || cv.height;
   cv.width = w * dpr; cv.height = h * dpr;
@@ -171,17 +236,31 @@ function drawPeaks(cv, peaks, sel, dur) {
     const v = (m / max) * (h / 2 - 1);
     g.fillRect(x, h / 2 - v, 1, Math.max(1, v * 2));
   }
+  if (head != null && dur) {
+    const x = Math.round((head / dur) * w) + 0.5;
+    g.strokeStyle = "#ffffff"; g.lineWidth = 1.5;
+    g.beginPath(); g.moveTo(x, 0); g.lineTo(x, h); g.stroke();
+    g.fillStyle = "#ffffff";
+    g.beginPath(); g.moveTo(x - 5, 0); g.lineTo(x + 5, 0); g.lineTo(x, 7); g.closePath(); g.fill();
+  }
 }
-function drawWave() { drawPeaks($("#wave"), state.peaks, state.sel, state.duration); }
+function drawWave() { drawPeaks($("#wave"), state.peaks, state.sel, state.duration, headTime(state.stem)); }
 
 (function setupSelection() {
   const cv = $("#wave"); let dragging = false, x0 = 0;
   const t = (e) => Math.max(0, Math.min(state.duration, ((e.clientX - cv.getBoundingClientRect().left) / cv.clientWidth) * state.duration));
-  cv.addEventListener("mousedown", (e) => { dragging = true; x0 = t(e); state.sel = [x0, x0]; drawWave(); });
+  let prevSel = null;
+  cv.addEventListener("mousedown", (e) => { dragging = true; x0 = t(e); prevSel = state.sel; state.sel = [x0, x0]; drawWave(); });
   window.addEventListener("mousemove", (e) => { if (!dragging) return; const x = t(e); state.sel = [Math.min(x0, x), Math.max(x0, x)]; drawWave(); updateSelInfo(); });
   window.addEventListener("mouseup", () => {
     if (!dragging) return; dragging = false;
-    if (state.sel && state.sel[1] - state.sel[0] < 0.05) state.sel = null;
+    if (state.sel && state.sel[1] - state.sel[0] < 0.05) {
+      // a click (not a drag) moves the playhead and plays from there
+      state.sel = prevSel;
+      drawWave(); updateSelInfo();
+      playFrom(state.stem, x0);
+      return;
+    }
     drawWave(); updateSelInfo(); loadSpectrogram();
   });
 })();
@@ -202,12 +281,9 @@ function loadSpectrogram() {
 }
 $("#clearSel").onclick = () => { state.sel = null; drawWave(); updateSelInfo(); $("#spec").hidden = true; };
 $("#playSel").onclick = () => {
+  if (!player.paused && state.playStem === state.stem) { player.pause(); return; }
   const r = selRange();
-  player.src = `/api/projects/${state.pid}/audio/${state.stem}`;
-  player.onloadedmetadata = () => {
-    player.currentTime = r.start || 0; player.play();
-    if (r.end) { const stop = () => { if (player.currentTime >= r.end) { player.pause(); player.removeEventListener("timeupdate", stop); } }; player.addEventListener("timeupdate", stop); }
-  };
+  playFrom(state.stem, r.start || 0, r.end);
 };
 $("#splitBtn").onclick = async () => {
   const n = parseInt(prompt("Split this stem into how many layers? (2-4)\nWorks best on a selection where the layers differ in register or timing.", "2"), 10);
@@ -317,14 +393,35 @@ function showResult(r) {
 }
 
 // ------------------------------------------------------------------ jobs
+const clock = (s) => { s = Math.max(0, Math.round(s || 0)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
 function showJob(j) {
   $("#jobBox").hidden = false;
-  $("#jobStage").textContent = `${j.kind || ""} · ${j.stage || j.status || ""}`;
-  $("#jobBest").textContent = j.best != null ? `best ${fmt(j.best, 1)}` : "";
+  const d = j.detail || {};
+  const kind = { reconstruct: "Reconstructing patch", separate: "Separating stems", split: "Splitting layers", calibrate: "Calibrating" }[j.kind] || j.kind || "";
+  $("#jobStage").textContent = `${kind}${j.status === "done" ? " · done" : ""}`;
+  let timing = `running ${clock(j.elapsed)}`;
+  if (j.status === "done") timing = `finished in ${clock(j.elapsed)}`;
+  else if (d.budget && d.elapsed != null) timing += ` · search ${clock(d.elapsed)} of ${clock(d.budget)} (~${clock(d.budget - d.elapsed)} left)`;
+  $("#jobTime").textContent = timing;
+  $("#jobBest").textContent = j.best != null ? `best match ${fmt(j.best, 1)}` : "";
+  let now = d.stage_text || j.stage || "";
+  if (d.activity) now += ` — ${d.activity}`;
+  const bits = [];
+  if (d.stage_elapsed != null) bits.push(`this step ${clock(d.stage_elapsed)}`);
+  if (d.stage_evals) bits.push(`${d.stage_evals.toLocaleString()} patches tested${d.rate ? ` (${fmt(d.rate, 0)}/s)` : ""}`);
+  if (d.evals) bits.push(`${d.evals.toLocaleString()} total`);
+  $("#jobNow").textContent = j.status === "error" ? "" : (now ? "Now: " + now + (bits.length ? "  ·  " + bits.join(" · ") : "") : "");
   $("#jobBar").style.width = `${Math.round((j.progress || 0) * 100)}%`;
   const pre = $("#jobLog");
-  pre.textContent = (j.log || []).map((l) => `${l.t}s  ${l.msg}`).join("\n");
-  pre.scrollTop = pre.scrollHeight;
+  const text = (j.log || []).map((l) => `${l.t}s  ${l.msg}`).join("\n");
+  if (pre.textContent !== text) {
+    // follow new lines only if the user is already at the bottom; never yank
+    // them away from something they scrolled up to read
+    const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 24;
+    const keep = pre.scrollTop;
+    pre.textContent = text;
+    pre.scrollTop = atBottom ? pre.scrollHeight : keep;
+  }
 }
 function pollJob(jid, done) {
   clearInterval(state.polling[jid]);
@@ -359,7 +456,23 @@ $("#saveSettings").onclick = async () => {
   checkUpdate();
 };
 $("#calibrateBtn").onclick = async () => { const r = await post("/api/calibrate"); $("#settings").close(); pollJob(r.job, (j) => alert(j.status === "done" ? "Calibrated: " + JSON.stringify(j.result) : "Calibration failed: " + j.error)); };
-$("#bpm").onchange = updateSelInfo;
+function renderBpmAlts() {
+  const box = $("#bpmAlts"); box.innerHTML = "";
+  const c = (state.meta.bpm_candidates || []).filter((x) => Math.abs(x - parseFloat($("#bpm").value)) > 0.01).slice(0, 4);
+  if (!c.length) return;
+  box.insertAdjacentHTML("beforeend", `<span class="muted small">or</span>`);
+  c.forEach((x) => {
+    const b = document.createElement("button"); b.className = "pill"; b.textContent = x;
+    b.title = "Use this tempo (half/double-time and triplet feels are easy to confuse)";
+    b.onclick = () => { $("#bpm").value = x; $("#bpm").onchange(); };
+    box.appendChild(b);
+  });
+}
+$("#bpm").onchange = () => {
+  const v = parseFloat($("#bpm").value);
+  if (v > 0 && state.pid) { post(`/api/projects/${state.pid}/bpm`, { bpm: v }); state.meta.bpm = v; }
+  renderBpmAlts(); updateSelInfo();
+};
 
 // ------------------------------------------------------------------ drag & drop
 const drop = $("#drop");

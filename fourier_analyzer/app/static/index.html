@@ -44,11 +44,14 @@
         <div>
           <h2 id="projName"></h2>
           <div class="muted" id="projInfo"></div>
+          <div id="dspWarn" class="warnbox" hidden>These stems came from the basic fallback splitter, not the AI models.
+            <button id="resepBtn" class="primary">Re-separate with AI models</button></div>
         </div>
-        <div class="bpm">BPM <input id="bpm" type="number" step="0.01" min="40" max="300"></div>
+        <div class="bpm">BPM <input id="bpm" type="number" step="0.01" min="40" max="300"><span id="bpmAlts" class="bpm-alts"></span></div>
       </div>
       <div id="jobBox" class="job" hidden>
-        <div class="job-row"><span id="jobStage"></span><span id="jobBest"></span></div>
+        <div class="job-row"><span><b id="jobStage"></b> <span id="jobTime" class="muted mono"></span></span><span id="jobBest"></span></div>
+        <div id="jobNow" class="job-now"></div>
         <div class="bar"><div id="jobBar"></div></div>
         <pre id="jobLog"></pre>
       </div>
@@ -67,6 +70,7 @@
         <div class="ed-head">
           <h3 id="edTitle">Selection</h3>
           <div class="ed-tools">
+            <span id="playTime" class="mono"></span>
             <span id="selInfo" class="muted mono"></span>
             <button id="playSel">▶ Play selection</button>
             <button id="clearSel" class="ghost">Clear</button>
@@ -74,6 +78,7 @@
           </div>
         </div>
         <canvas id="wave" height="140"></canvas>
+        <div class="muted small hint">Drag to select · click to play from a point · space = play/pause</div>
         <img id="spec" alt="spectrogram" hidden>
         <div class="tabs">
           <button class="tab active" data-tab="fourier">Fourier analysis</button>

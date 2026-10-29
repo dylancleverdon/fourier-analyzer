@@ -132,6 +132,7 @@ def separate_all(src: Path, out_dir: Path, progress: Callable[[str], None] | Non
             use_ml = False
     if not stems:
         stems = separate_dsp(src, out_dir, progress)
+        use_ml = False
     if drums and "drums" in stems:
         ddir = out_dir / "drums_parts"
         parts = {}
@@ -146,6 +147,7 @@ def separate_all(src: Path, out_dir: Path, progress: Callable[[str], None] | Non
             parts = separate_drums_dsp(stems["drums"], ddir)
         for n, p in parts.items():
             stems[f"drum_{n}"] = p
+    separate_all.last_method = "ml" if use_ml else "dsp"
     return stems
 
 

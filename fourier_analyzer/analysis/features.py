@@ -58,18 +58,88 @@ class Analysis:
         }
 
 
-def estimate_bpm(y: np.ndarray, sr: int) -> float:
+def tempo_candidates(y: np.ndarray, sr: int, lo: float = 70.0, hi: float = 190.0):
+    """Tempo estimation with sub-BPM precision.
+
+    1. Onset-strength envelope at ~6 ms resolution.
+    2. For every tempo in 0.05 BPM steps, average the (overlap-normalised)
+       autocorrelation at 1..8 beat lags. Interpolating at fractional lags
+       gives precision far below the frame rate.
+    3. Multiply by a broad prior centred on 140 BPM (bass music) to resolve
+       half/double-time ambiguity.
+    4. Refine the winner by fitting a beat grid (tempo + phase) to the onsets,
+       and snap to a whole BPM when that fits equally well.
+
+    Returns a list of {"bpm", "score"} sorted best first, including the
+    half/double/2:3 alternatives so the UI can offer them."""
     import librosa
-    tempo, _ = librosa.beat.beat_track(y=y, sr=sr, hop_length=512)
-    bpm = float(np.atleast_1d(tempo)[0]) if np.size(tempo) else 140.0
-    if bpm <= 0:
-        bpm = 140.0
-    # dubstep / bass music is usually notated 130-180; fold halves/doubles
-    while bpm < 95:
-        bpm *= 2
-    while bpm > 190:
-        bpm /= 2
-    return bpm
+    hop = 128
+    fps = sr / hop
+    env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop, aggregate=np.mean, n_mels=96)
+    env = np.maximum(env - np.median(env), 0)
+    n = len(env)
+    if n < 16 or not np.any(env):
+        return [{"bpm": 140.0, "score": 0.0}]
+    f = np.fft.rfft(env - env.mean(), 2 * n)
+    ac = np.fft.irfft(f * np.conj(f))[:n]
+    ac = ac / (n - np.arange(n))           # unbiased
+    ac = ac / (ac[0] + 1e-12)
+    bpms = np.arange(lo, hi + 1e-9, 0.05)
+    period = fps * 60.0 / bpms
+    comb = np.zeros_like(bpms)
+    cnt = np.zeros_like(bpms)
+    for k in range(1, 9):
+        lag = period * k
+        ok = lag < n * 0.7
+        comb[ok] += np.interp(lag[ok], np.arange(n), ac)
+        cnt[ok] += 1
+    comb = np.where(cnt > 0, comb / np.maximum(cnt, 1), 0)
+    prior = np.exp(-0.5 * (np.log2(bpms / 140.0) / 0.55) ** 2)
+    score = np.maximum(comb, 0) * prior
+
+    def grid_fit(bpm):
+        per = fps * 60.0 / bpm
+        best = 0.0
+        for ph in np.linspace(0, per, 96, endpoint=False):
+            pos = np.arange(ph, n - 1, per / 2)   # beats and off-beats
+            w = np.where(np.arange(len(pos)) % 2 == 0, 1.0, 0.5)
+            v = float((np.interp(pos, np.arange(n), env) * w).sum() / max(1, w.sum()))
+            best = max(best, v)
+        return best
+
+    # local maxima of the score as candidates
+    peaks = [i for i in range(1, len(score) - 1) if score[i] >= score[i - 1] and score[i] >= score[i + 1]]
+    peaks = sorted(peaks, key=lambda i: -score[i])[:6]
+    out = []
+    for i in peaks:
+        c = bpms[i]
+        fine = np.arange(c - 0.6, c + 0.6, 0.02)
+        fits = np.array([grid_fit(x) for x in fine])
+        bpm = float(fine[np.argmax(fits)])
+        r = round(bpm)
+        if abs(bpm - r) < 0.4 and grid_fit(r) >= fits.max() * 0.95:
+            bpm = float(r)
+        elif abs(bpm * 2 - round(bpm * 2)) < 0.2 and grid_fit(round(bpm * 2) / 2) >= fits.max() * 0.95:
+            bpm = round(bpm * 2) / 2
+        out.append({"bpm": round(bpm, 2), "score": round(float(score[i]), 4)})
+    # deduplicate (within 0.5 BPM) and add musical relatives of the winner
+    uniq = []
+    for c in out:
+        if all(abs(c["bpm"] - u["bpm"]) > 0.5 for u in uniq):
+            uniq.append(c)
+    # alternatives = musical relatives of the winner only (half/double time,
+    # triplet feel); unrelated autocorrelation peaks just confuse
+    best = uniq[0]
+    out = [best]
+    for mult in (0.5, 2.0, 2 / 3, 1.5):
+        alt = round(best["bpm"] * mult * 2) / 2
+        if 50 <= alt <= 220:
+            out.append({"bpm": alt, "score": 0.0})
+    return out
+
+
+def estimate_bpm(y: np.ndarray, sr: int) -> float:
+    return float(tempo_candidates(y, sr)[0]["bpm"])
 
 
 def _frames_stft(y, sr):

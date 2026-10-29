@@ -17,7 +17,8 @@ python-multipart>=0.0.9
 pillow>=10.0
 imageio-ffmpeg>=0.5
 # source separation (Demucs v4 + MDX23C DrumSep) - pulls in torch with Apple-GPU (MPS) support
-audio-separator>=0.30
+audio-separator[cpu]>=0.30
+onnxruntime>=1.17
 # hosting the real Serum 2 plugin for verification/calibration
 pedalboard>=0.9.14
 # native window

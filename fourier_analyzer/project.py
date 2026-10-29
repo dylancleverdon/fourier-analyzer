@@ -36,6 +36,13 @@ class Job:
     result: dict | None = None
     error: str | None = None
     created: float = field(default_factory=time.time)
+    detail: dict = field(default_factory=dict)   # live status (what is happening right now)
+    finished: float | None = None
+
+    def set(self, stage: str, text: str, **extra):
+        """Update the live status line without adding to the log."""
+        self.stage = stage
+        self.detail = {"stage_text": text, "stage_t0": time.time(), **extra}
 
     def msg(self, text: str):
         self.log.append({"t": round(time.time() - self.created, 1), "msg": text})
@@ -43,9 +50,14 @@ class Job:
         log.info("[job %s] %s", self.id, text)
 
     def to_dict(self):
+        end = self.finished or time.time()
+        d = dict(self.detail)
+        if "stage_t0" in d:
+            d["stage_elapsed"] = round(end - d.pop("stage_t0"), 1)
         return {"id": self.id, "kind": self.kind, "project": self.project, "status": self.status,
                 "progress": round(self.progress, 3), "stage": self.stage, "best": self.best,
-                "log": self.log[-80:], "result": self.result, "error": self.error}
+                "elapsed": round(end - self.created, 1), "detail": d,
+                "log": self.log[-300:], "result": self.result, "error": self.error}
 
 
 class JobManager:
@@ -69,6 +81,8 @@ class JobManager:
                 job.status = "error"
                 job.error = f"{type(e).__name__}: {e}"
                 job.msg(traceback.format_exc())
+            finally:
+                job.finished = time.time()
         self.pool.submit(run)
         return job
 
@@ -125,26 +139,36 @@ def create_project(upload_path: Path, original_name: str) -> dict:
 
 def start_separation(pid: str, drums: bool = True) -> Job:
     def work(job: Job):
-        from .analysis.features import estimate_bpm
+        from .analysis.features import tempo_candidates
         from .analysis.instruments import describe_all
         from .separation.stems import separate_all
         d = project_dir(pid)
         meta = load_meta(pid)
         meta["status"] = "separating"
         save_meta(pid, meta)
-        job.stage = "tempo"
+        job.set("tempo", "Detecting tempo")
         y, sr = audio.load(d / "mix.wav", sr=22050)
-        meta["bpm"] = round(estimate_bpm(y, sr), 2)
-        job.msg(f"tempo estimate {meta['bpm']} BPM")
-        job.stage = "separating"
+        cands = tempo_candidates(y, sr)
+        meta["bpm"] = cands[0]["bpm"]
+        meta["bpm_candidates"] = [c["bpm"] for c in cands[:6]]
+        job.msg(f"tempo estimate {meta['bpm']} BPM (alternatives: "
+                f"{', '.join(str(c) for c in meta['bpm_candidates'][1:4])})")
+        job.set("separating", "Separating stems with AI models (Demucs, then DrumSep on the drums). "
+                              "This is the slow part: about 1-3 min per minute of audio")
         job.progress = 0.05
 
         def prog(text):
             job.msg(text)
             job.progress = min(0.85, job.progress + 0.1)
+        for old in (d / "stems").glob("*"):          # re-separation replaces old stems
+            if old.is_dir():
+                shutil.rmtree(old, ignore_errors=True)
+            else:
+                old.unlink(missing_ok=True)
         stems = separate_all(d / "mix.wav", d / "stems", progress=prog, drums=drums)
+        meta["separation"] = getattr(separate_all, "last_method", "ml")
         meta["stems"] = {"mix": "mix.wav", **{k: str(Path(v).relative_to(d)) for k, v in stems.items()}}
-        job.stage = "detecting instruments"
+        job.set("instruments", "Labelling instruments in each stem")
         job.progress = 0.9
         meta["instruments"] = describe_all({k: d / v for k, v in meta["stems"].items() if k != "mix"},
                                            d / "mix.wav")
@@ -173,6 +197,24 @@ def start_layer_split(pid: str, stem: str, n_layers: int, start=None, end=None) 
         save_meta(pid, meta)
         return {"layers": list(out)}
     return JOBS.submit("split", work, project=pid)
+
+
+def redetect_tempo(pid: str) -> dict:
+    from .analysis.features import tempo_candidates
+    d = project_dir(pid)
+    meta = load_meta(pid)
+    y, sr = audio.load(d / "mix.wav", sr=22050)
+    cands = tempo_candidates(y, sr)
+    meta["bpm"] = cands[0]["bpm"]
+    meta["bpm_candidates"] = [c["bpm"] for c in cands[:6]]
+    save_meta(pid, meta)
+    return {"bpm": meta["bpm"], "candidates": meta["bpm_candidates"]}
+
+
+def set_bpm(pid: str, bpm: float) -> None:
+    meta = load_meta(pid)
+    meta["bpm"] = float(bpm)
+    save_meta(pid, meta)
 
 
 def load_segment(pid: str, stem: str, start: float | None, end: float | None, sr: int = 44100):
@@ -220,7 +262,7 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict) -> Job:
         if len(y44) < 4096:
             raise ValueError("selection too short")
         y22 = audio.resample(y44, 44100, OPT_SR)
-        job.stage = "analysis"
+        job.set("analysis", "Fourier analysis of the selection (pitch, notes, harmonics, LFO)")
         job.msg("Fourier analysis of the selection")
         a = analyze(y22, OPT_SR, bpm=bpm)
         job.msg(f"{len(a.notes)} notes, voiced {a.voiced_ratio:.0%}, noise {a.noise_ratio:.0%}, "
@@ -228,16 +270,18 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict) -> Job:
         bank = TableBank()
         stock = None
         if config.serum_tables_dir():
-            job.stage = "indexing Serum tables"
+            job.set("indexing", "Indexing your Serum 2 stock wavetables (cached after the first time)")
             job.msg(f"indexing stock wavetables in {config.serum_tables_dir()}")
             stock = StockIndex().build()
             job.msg(f"{len(stock.ids)} stock tables indexed")
         else:
             job.msg("Serum tables folder not found: using built-in basic shapes only")
 
-        def prog(stage, frac, best, text):
+        def prog(stage, frac, best, text, status=None):
             job.stage, job.progress = stage, 0.05 + 0.85 * frac
             job.best = round(best, 2) if best is not None else None
+            if status:
+                job.detail = dict(status)
             if text:
                 job.msg(text)
         o = Options(target_score=float(opts.get("target", 90)),
@@ -246,8 +290,9 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict) -> Job:
                     time_budget=float(opts.get("time_budget", 240)))
         opt = Optimizer(y22, OPT_SR, a, o, bank=bank, stock=stock, progress=prog)
         res = opt.run()
-        job.stage = "verification"
         job.msg(f"accuracy {res.score:.1f} (raw {res.details['raw_score']}); running checks")
+        job.set("verification", "Verification: removing each component, noise attribution, timing and pitch checks")
+        job.progress = 0.92
         checks = run_checks(res.patch, opt.y, OPT_SR, opt.notes, a.f0[: int(len(opt.y) / 256) + 1],
                             opt.renderer, opt.target)
 
@@ -269,6 +314,8 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict) -> Job:
 
         serum = {"ok": False, "error": "skipped"}
         if opts.get("verify_serum", True):
+            job.set("serum", "Rendering the preset in the real Serum 2 plugin")
+            job.progress = 0.96
             job.msg("rendering in real Serum 2 for verification")
             serum = serum_host.verify(preset, a.notes, y44, 44100)
             if serum.get("ok"):

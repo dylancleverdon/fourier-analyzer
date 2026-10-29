@@ -180,6 +180,21 @@ def spectrogram(pid: str, stem: str, start: float = 0.0, end: float = 0.0, w: in
     return Response(buf.getvalue(), media_type="image/png")
 
 
+@app.post("/api/projects/{pid}/tempo")
+def tempo(pid: str):
+    return project.redetect_tempo(pid)
+
+
+class BpmIn(BaseModel):
+    bpm: float
+
+
+@app.post("/api/projects/{pid}/bpm")
+def set_bpm(pid: str, body: BpmIn):
+    project.set_bpm(pid, body.bpm)
+    return {"bpm": body.bpm}
+
+
 class SplitIn(BaseModel):
     stem: str
     layers: int = 2
@@ -217,6 +232,16 @@ def analyze(pid: str, body: RegionIn):
 def reconstruct(pid: str, body: RegionIn):
     job = project.start_reconstruct(pid, body.stem, body.start, body.end, body.model_dump())
     return {"job": job.id}
+
+
+@app.get("/api/jobs")
+def jobs(project: str | None = None):
+    return [{"id": j.id, "kind": j.kind, "status": j.status} for j in project_mod_jobs(project)]
+
+
+def project_mod_jobs(pid):
+    return [j for j in project.JOBS.jobs.values()
+            if j.status in ("queued", "running") and (pid is None or j.project == pid)]
 
 
 @app.get("/api/jobs/{jid}")
