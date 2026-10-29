@@ -54,8 +54,11 @@ There is deliberately no signing or checksum verification; update speed was prio
    2. **Structure search** tries adding one component at a time and keeps it only if the fit improves. Candidates include:
       - noise, unison, sub, and a second custom oscillator
       - **Serum warp modes on osc A: FM, AM and RM from osc B, and FM and RM from the sub**
+      - phase and shape warps (Sync, Bend, PWM, Asym, Mirror, Quantize, Self-PD, Even/Odd, Flip, Dist), a second warp slot and unison stacks
       - LFO routings, filters, filter and pitch envelopes
-      - distortion modes, OTT, EQ and glide
+      - Serum filter models (Ladder, Comb, Phase, Flange, Formant, Diffuser, Scream, morphing) and a parallel filter 2
+      - FX-rack modules: distortion modes, chorus, flanger, phaser, hyperdimension, frequency shifter, FX filter, compressor, reverb, convolve and tempo-synced delay, plus a multiband split
+      - OTT, EQ and glide
    3. **Pruning** removes each component in turn and drops it if the fit holds.
    4. **Fine-tuning** of every parameter with CMA-ES.
    5. **Waveform alignment**: start phase, fine tune, the amp envelope and each note's start time (±6 ms) are tuned to maximise literal waveform correlation. The refined note timing also goes into the exported MIDI.
@@ -96,6 +99,28 @@ Reported alongside it, all standard definitions:
 | Envelope correlation | Pearson correlation of the RMS loudness envelopes |
 
 Waveform similarity is phase sensitive. Sounds with random-phase unison, noise or reverb in the original can sound identical while correlating poorly sample by sample; spectral similarity shows how close the timbre is regardless. The **stop-early slider** applies to waveform similarity. The search itself optimises a blend of a perceptual spectro-temporal measure and spectral similarity, then waveform correlation in the final stage.
+
+### Serum 2 feature coverage
+
+The patch model, renderer and preset mapping cover:
+- 3 wavetable oscillators plus noise and sub (pulse and round-rect too)
+- both warp slots per oscillator, with every warp mode
+- unison with detune, blend, range and stacks
+- start phase and random phase
+- both filters with the full Serum filter list, split into about 20 rendered families, with per-source routing (filter balance, direct out and FX bus sends)
+- 4 envelopes with curve shapes
+- 10 LFOs: shapes, custom curved points, S&H random, Lorenz and Rössler chaos, rise, delay and smooth
+- 8 macros
+- a 64-slot mod matrix with aux sources
+- the main FX rack and both FX buses, with all 16 module types, including nested 2-band, 3-band and mid/side splitters
+
+Any Serum 2 preset can be imported. All 701 test presets load and render.
+
+What is **not emulated**:
+- sample, granular, spectral and multisample oscillators. Their source files aren't in the preset, so the reconstruction rebuilds those sounds with custom wavetables instead.
+- the arpeggiator and clip player. Use the exported MIDI.
+
+The FX and filter DSP reproduces how each module behaves, not Serum's exact algorithms. Calibrate against the real Serum check.
 
 ### What maps exactly and what is calibrated
 

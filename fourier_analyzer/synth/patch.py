@@ -15,16 +15,64 @@ from typing import Optional
 # Serum 2 has three primary oscillators (A, B, C) plus sub and noise.
 MAX_OSCS = 3
 
+N_ENVS = 4
+N_LFOS = 10
+N_MACROS = 8
+
 LFO_SHAPES = ("sine", "triangle", "saw_down", "saw_up", "square", "custom")
+LFO_TYPES = ("shape", "random", "lorenz", "rossler", "path")
+# Filter types are Serum 2's own names (L24, MgL24, LadderAcid, Comb2, ...);
+# the short legacy names lp12/lp24/hp12/hp24/bp12 are accepted too.
 FILTER_TYPES = ("lp12", "lp24", "hp12", "hp24", "bp12")
+# Distortion modes: Serum 2 names without the leading "k" (Overdrive,
+# SoftSat, Diode1, ...); legacy soft/hard/tube/sinefold/linfold/diode accepted.
 DIST_MODES = ("soft", "hard", "tube", "sinefold", "linfold", "diode")
+# Warp modes: Serum 2 names without the leading "k" (Sync, PD_OSC, FM_SUB,
+# BendPos, DistTube, FilterLPF, ...); legacy fm_b/fm_sub/am_b/rm_b/rm_sub ok.
 WARP_MODES = ("none", "fm_b", "fm_sub", "am_b", "rm_b", "rm_sub")
-MOD_SOURCES = ("env1", "env2", "env3", "lfo1", "lfo2", "lfo3", "lfo4")
+MOD_SOURCES = (tuple(f"env{i}" for i in range(1, N_ENVS + 1)) + tuple(f"lfo{i}" for i in range(1, N_LFOS + 1))
+               + ("velocity", "note", "modwheel") + tuple(f"macro{i}" for i in range(1, N_MACROS + 1)))
 # amount 1.0 means: cutoff +10 octaves, pos +1 (whole table), level +1,
-# pitch +48 semitones, drive +1.
+# pitch +48 semitones, drive +1, fine +100 cents, pan +1, warp +1, mix +1.
 MOD_DESTS = ("osc1.pos", "osc2.pos", "osc3.pos", "osc1.level", "osc2.level",
-             "osc3.level", "filter.cutoff", "filter.reso", "pitch", "amp",
-             "dist.drive", "noise.level")
+             "osc3.level", "osc1.warp", "osc2.warp", "osc3.warp", "osc1.warp2", "osc2.warp2", "osc3.warp2",
+             "osc1.fine", "osc2.fine", "osc3.fine", "osc1.pan", "osc2.pan", "osc3.pan",
+             "filter.cutoff", "filter.reso", "filter.drive", "filter.var",
+             "filter2.cutoff", "filter2.reso", "filter2.drive", "filter2.var",
+             "pitch", "amp", "dist.drive", "noise.level", "sub.level",
+             "fx.<index>.mix", "fx.<index>.drive")
+
+# Effect modules (Patch.fx_chain / fx_buses entries are dicts with "type")
+FX_TYPES = ("distortion", "flanger", "phaser", "chorus", "delay", "comp", "reverb", "eq", "filter",
+            "hyperdim", "bode", "convolve", "utility", "split", "split3", "splitms")
+FX_DEFAULTS = {
+    "distortion": {"mode": "Overdrive", "drive": 0.3, "mix": 1.0, "filter": "off", "filter_freq": 0.5, "filter_bw": 0.5},
+    "flanger": {"rate_hz": 0.3, "depth": 0.5, "feedback": 0.5, "mix": 0.5},
+    "phaser": {"rate_hz": 0.3, "depth": 0.5, "freq": 800.0, "feedback": 0.4, "stages": 4, "mix": 0.5},
+    "chorus": {"rate_hz": 0.8, "depth": 0.3, "delay_ms": 7.0, "feedback": 0.0, "mix": 0.3},
+    "delay": {"time": 0.25, "time2": 0.25, "feedback": 0.35, "freq": 2000.0, "bw": 3.0, "mix": 0.25},
+    "comp": {"multiband": True, "depth": 0.5, "amount": 0.6, "threshold_db": -18.0, "ratio": 4.0,
+             "attack_ms": 5.0, "release_ms": 80.0, "makeup_db": 0.0},
+    "reverb": {"kind": "Hall", "size": 0.5, "decay": 1.5, "damping": 0.5, "predelay": 0.0, "mix": 0.2},
+    "eq": {"freq1": 120.0, "gain1": 0.0, "q1": 0.7, "type1": "lowshelf",
+           "freq2": 6000.0, "gain2": 0.0, "q2": 0.7, "type2": "highshelf"},
+    "filter": {"ftype": "L24", "cutoff": 2000.0, "reso": 0.2, "drive": 0.0, "var": 0.5, "mix": 1.0},
+    "hyperdim": {"rate": 0.4, "detune": 0.3, "voices": 4, "dim_size": 0.5, "mix": 0.4},
+    "bode": {"shift_hz": 50.0, "feedback": 0.0, "mix": 0.5},
+    "convolve": {"size": 0.5, "decay": 1.0, "tone": 0.0, "predelay": 0.0, "mix": 0.2},
+    "utility": {"gain_db": 0.0, "hpf": 0.0, "lpf": 0.0, "invert": False},
+    "split": {"freq": 300.0, "bands": [[], []]},
+    "split3": {"freq": 200.0, "freq2": 2000.0, "bands": [[], [], []]},
+    "splitms": {"bands": [[], []]},
+}
+
+
+def fx(fx_type: str, /, **kw) -> dict:
+    """New effect-module dict with defaults."""
+    d = {"type": fx_type, "enabled": True}
+    d.update(copy.deepcopy(FX_DEFAULTS.get(fx_type, {})))
+    d.update(kw)
+    return d
 
 
 @dataclass
@@ -47,6 +95,10 @@ class Osc:
     # / ring modulation). Osc B can sit at level 0 and act only as modulator.
     warp: str = "none"
     warp_amount: float = 0.0      # 0..1
+    warp2: str = "none"           # second warp slot (applied after the first)
+    warp2_amount: float = 0.0
+    unison_stack: str = "none"    # none | Octave1..3 | OctaveFifth1..3 | Center12
+    unison_range: float = 2.0     # semitones spread at detune 1.0 (Serum "range")
 
 
 @dataclass
@@ -72,6 +124,8 @@ class Filter:
     reso: float = 0.1             # 0..1
     drive: float = 0.0            # 0..1
     keytrack: float = 0.0         # 0..1
+    var: float = 0.5              # 0..1 type-specific (morph, comb damping, vowel ...)
+    mix: float = 1.0              # 0..1 wet
 
 
 @dataclass
@@ -81,6 +135,9 @@ class Env:
     decay: float = 0.3
     sustain: float = 1.0
     release: float = 0.05
+    attack_curve: float = 0.5     # 0..1 (0.5 = linear); Serum curve 0..100 / 100
+    decay_curve: float = 0.666
+    release_curve: float = 0.666
 
 
 @dataclass
@@ -90,7 +147,11 @@ class LFO:
     sync: Optional[str] = None    # e.g. "1/8", "1/4T", "1/16D"; overrides rate_hz
     phase: float = 0.0            # 0..1
     mode: str = "trig"            # trig | free | env (one shot)
-    points: Optional[list] = None  # custom shape: [[x, y], ...] in 0..1
+    points: Optional[list] = None  # custom shape: [[x, y], ...] or [[x, y, curve], ...]
+    type: str = "shape"           # shape | random (S&H) | lorenz | rossler | path
+    rise: float = 0.0             # seconds to fade in after note-on
+    delay: float = 0.0            # seconds before the LFO starts
+    smooth: float = 0.0           # 0..1 slew
 
 
 @dataclass
@@ -99,6 +160,7 @@ class Mod:
     dest: str = "filter.cutoff"
     amount: float = 0.0           # -1..1, see MOD_DESTS comment
     bipolar: bool = False
+    aux: Optional[str] = None     # optional second source that scales this one
 
 
 @dataclass
@@ -140,9 +202,17 @@ class Patch:
     sub: SubOsc = field(default_factory=SubOsc)
     noise: NoiseOsc = field(default_factory=NoiseOsc)
     filter: Filter = field(default_factory=Filter)
-    envs: list = field(default_factory=lambda: [Env(), Env(sustain=0.0), Env(sustain=0.0)])
-    lfos: list = field(default_factory=lambda: [LFO(), LFO(), LFO(), LFO()])
+    filter2: Filter = field(default_factory=Filter)
+    # per source (osc1, osc2, osc3, noise, sub): dest filter|direct|none,
+    # balance 0 = filter 1 only .. 1 = filter 2 only, and FX bus sends 0..1
+    routing: dict = field(default_factory=dict)
+    envs: list = field(default_factory=lambda: [Env(), Env(sustain=0.0), Env(sustain=0.0), Env(sustain=0.0)])
+    lfos: list = field(default_factory=lambda: [LFO() for _ in range(N_LFOS)])
+    macros: list = field(default_factory=lambda: [0.0] * N_MACROS)
     mods: list = field(default_factory=list)
+    fx_chain: list = field(default_factory=list)     # main FX rack, in order
+    fx_buses: list = field(default_factory=lambda: [[], []])
+    bus_levels: list = field(default_factory=lambda: [1.0, 1.0])
     distortion: Distortion = field(default_factory=Distortion)
     ott: OTT = field(default_factory=OTT)
     eq: EQ = field(default_factory=EQ)
@@ -174,9 +244,19 @@ class Patch:
         p.sub = SubOsc(**d.get("sub", {}))
         p.noise = NoiseOsc(**d.get("noise", {}))
         p.filter = Filter(**d.get("filter", {}))
+        p.filter2 = Filter(**d.get("filter2", {}))
+        p.routing = d.get("routing", {}) or {}
         p.envs = [Env(**e) for e in d.get("envs", [])] or p.envs
+        while len(p.envs) < N_ENVS:
+            p.envs.append(Env(sustain=0.0))
         p.lfos = [LFO(**l) for l in d.get("lfos", [])] or p.lfos
+        while len(p.lfos) < N_LFOS:
+            p.lfos.append(LFO())
+        p.macros = (list(d.get("macros", [])) + [0.0] * N_MACROS)[:N_MACROS]
         p.mods = [Mod(**m) for m in d.get("mods", [])]
+        p.fx_chain = d.get("fx_chain", []) or []
+        p.fx_buses = (d.get("fx_buses") or [[], []]) + [[]] * 0
+        p.bus_levels = d.get("bus_levels", [1.0, 1.0])
         p.distortion = Distortion(**d.get("distortion", {}))
         p.ott = OTT(**d.get("ott", {}))
         p.eq = EQ(**d.get("eq", {}))
@@ -192,12 +272,22 @@ class Patch:
     def mods_for(self, dest: str):
         return [m for m in self.mods if m.dest == dest and m.amount != 0.0]
 
+    def route(self, source: str) -> dict:
+        """Routing of one source; default: through filter 1 if enabled."""
+        r = {"dest": "filter", "balance": 0.0, "send1": 0.0, "send2": 0.0}
+        r.update(self.routing.get(source, {}))
+        return r
+
     def describe(self) -> list[str]:
         """Human-readable summary lines for the UI."""
         out = []
         for i, o in self.active_oscs():
             uni = f", unison {o.unison} x detune {o.detune:.2f}" if o.unison > 1 else ""
             warp = f", warp {o.warp} {o.warp_amount:.2f}" if o.warp != "none" and o.warp_amount else ""
+            if o.warp2 != "none" and o.warp2_amount:
+                warp += f" + {o.warp2} {o.warp2_amount:.2f}"
+            if o.unison > 1 and o.unison_stack != "none":
+                warp += f", stack {o.unison_stack}"
             out.append(f"Osc {'ABC'[i]}: {o.table} @ pos {o.position:.2f}, "
                        f"oct {o.octave:+d} semi {o.semi:+d} fine {o.fine:+.0f}c, "
                        f"level {o.level:.2f}{uni}{warp}")
@@ -205,10 +295,13 @@ class Patch:
             out.append(f"Sub: {self.sub.shape} oct {self.sub.octave:+d} level {self.sub.level:.2f}")
         if self.noise.enabled:
             out.append(f"Noise: color {self.noise.color:.2f} level {self.noise.level:.2f}")
-        f = self.filter
-        if f.enabled:
-            out.append(f"Filter: {f.type} cutoff {f.cutoff:.0f} Hz reso {f.reso:.2f} drive {f.drive:.2f}")
-        names = ["Env1 (amp)", "Env2", "Env3"]
+        for label, f in (("Filter 1", self.filter), ("Filter 2", self.filter2)):
+            if f.enabled:
+                out.append(f"{label}: {f.type} cutoff {f.cutoff:.0f} Hz reso {f.reso:.2f} drive {f.drive:.2f}"
+                           + (f" var {f.var:.2f}" if f.var != 0.5 else "") + (f" mix {f.mix:.2f}" if f.mix < 1 else ""))
+        for src, r in sorted(self.routing.items()):
+            out.append(f"Routing {src}: {r}")
+        names = ["Env1 (amp)", "Env2", "Env3", "Env4"]
         for n, e in zip(names, self.envs):
             out.append(f"{n}: A {e.attack*1000:.1f}ms H {e.hold*1000:.0f}ms D {e.decay*1000:.0f}ms "
                        f"S {e.sustain:.2f} R {e.release*1000:.0f}ms")
@@ -216,11 +309,16 @@ class Patch:
         for i, l in enumerate(self.lfos):
             if f"lfo{i+1}" in used:
                 rate = l.sync if l.sync else f"{l.rate_hz:.2f} Hz"
-                out.append(f"LFO{i+1}: {l.shape} {rate} ({l.mode})")
+                kind = l.shape if l.type == "shape" else l.type
+                extra = "".join(f", {k} {getattr(l, k):.2f}" for k in ("rise", "delay", "smooth") if getattr(l, k))
+                out.append(f"LFO{i+1}: {kind} {rate} ({l.mode}){extra}")
         for m in self.mods:
             if m.amount:
                 out.append(f"Mod: {m.source} -> {m.dest} amount {m.amount:+.3f}"
-                           + (" (bipolar)" if m.bipolar else ""))
+                           + (" (bipolar)" if m.bipolar else "") + (f" x {m.aux}" if m.aux else ""))
+        for i, v in enumerate(self.macros):
+            if v:
+                out.append(f"Macro {i+1}: {v:.2f}")
         if self.distortion.enabled:
             d = self.distortion
             out.append(f"FX Distortion: {d.mode} drive {d.drive:.2f} mix {d.mix:.2f}")
@@ -232,6 +330,19 @@ class Patch:
         if self.chorus.enabled:
             c = self.chorus
             out.append(f"FX Chorus: rate {c.rate_hz:.2f} Hz depth {c.depth:.2f} mix {c.mix:.2f}")
+        def fx_lines(chain, prefix):
+            for k, e in enumerate(chain):
+                if not e.get("enabled", True):
+                    continue
+                params = ", ".join(f"{a} {b:.2f}" if isinstance(b, float) else f"{a} {b}"
+                                   for a, b in e.items() if a not in ("type", "enabled", "bands"))
+                out.append(f"{prefix}{k + 1} {e['type']}: {params}")
+                for bi, band in enumerate(e.get("bands", []) or []):
+                    fx_lines(band, f"{prefix}{k + 1}.band{bi + 1}.")
+        fx_lines(self.fx_chain, "FX ")
+        for b, chain in enumerate(self.fx_buses):
+            if chain:
+                fx_lines(chain, f"Bus{b + 1} FX ")
         out.append(f"Voicing: {'mono' if self.mono else 'poly'}, glide {self.glide*1000:.0f} ms")
         return out
 

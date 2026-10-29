@@ -86,6 +86,11 @@ def render_env(env: Env, tl: Timeline) -> np.ndarray:
     sr = tl.sr
     a, h, d = max(env.attack, 1e-4), max(env.hold, 0.0), max(env.decay, 1e-4)
     s, r = float(np.clip(env.sustain, 0, 1)), max(env.release, 1e-4)
+    # curves: 0.5 attack = linear; 0.666 decay/release = Serum's default
+    # exponential (~ -40 dB at the end of the stage); others bend the shape
+    pa = 2 ** ((0.5 - getattr(env, "attack_curve", 0.5)) * 4)
+    kd = 2 ** ((getattr(env, "decay_curve", 0.666) - 0.666) * 4)
+    kr = 2 ** ((getattr(env, "release_curve", 0.666) - 0.666) * 4)
     level_prev = 0.0
     for (st, off, nxt) in tl.bounds:
         n_on = off - st
@@ -93,20 +98,33 @@ def render_env(env: Env, tl: Timeline) -> np.ndarray:
         lv = np.empty_like(t)
         # attack from the current level (Serum retriggers smoothly in mono)
         att = t < a
-        lv[att] = level_prev + (1 - level_prev) * (t[att] / a)
+        lv[att] = level_prev + (1 - level_prev) * (t[att] / a) ** pa
         hd = (~att) & (t < a + h)
         lv[hd] = 1.0
         dec = t >= a + h
         x = (t[dec] - a - h) / d
-        lv[dec] = s + (1 - s) * np.exp(-4.6 * x)      # ~ -40 dB at x = 1
+        lv[dec] = s + (1 - s) * np.exp(-4.6 * kd * x)
         if n_on < len(t):
             rel_start = max(n_on, 0)
             l0 = lv[rel_start - 1] if rel_start > 0 else level_prev
             tr = t[rel_start:] - t[rel_start]
-            lv[rel_start:] = l0 * np.exp(-4.6 * tr / r)
+            lv[rel_start:] = l0 * np.exp(-4.6 * kr * tr / r)
         out[st:nxt] = lv
         level_prev = lv[-1] if len(lv) else 0.0
     return out
+
+
+def _curve_interp(ph, points):
+    """Piecewise curve through [x, y(, curve)] points; curve 0.5 = straight."""
+    xs = np.array([p[0] for p in points], dtype=float)
+    ys = np.array([p[1] for p in points], dtype=float)
+    cs = np.array([p[2] if len(p) > 2 else 0.5 for p in points], dtype=float)
+    idx = np.clip(np.searchsorted(xs, ph, side="right") - 1, 0, len(xs) - 2)
+    x0, x1 = xs[idx], xs[idx + 1]
+    t = np.where(x1 > x0, (ph - x0) / np.maximum(x1 - x0, 1e-9), 0.0)
+    k = 2 ** ((cs[idx] - 0.5) * 6)
+    t = np.clip(t, 0, 1) ** k
+    return ys[idx] + (ys[idx + 1] - ys[idx]) * t
 
 
 def lfo_shape(shape: str, ph: np.ndarray, points=None) -> np.ndarray:
@@ -121,22 +139,58 @@ def lfo_shape(shape: str, ph: np.ndarray, points=None) -> np.ndarray:
         return 1.0 - ph
     if shape == "square":
         return (ph < 0.5).astype(float)
-    if shape == "custom" and points:
-        xs = np.array([p[0] for p in points], dtype=float)
-        ys = np.array([p[1] for p in points], dtype=float)
-        return np.interp(ph, xs, ys)
+    if shape == "custom" and points and len(points) >= 2:
+        return _curve_interp(ph, points)
     return 0.5 - 0.5 * np.cos(2 * np.pi * ph)
 
 
-def render_lfo(lfo, tl: Timeline, bpm: float) -> np.ndarray:
+def _chaos(kind: str, steps: int, dt: float, seed: int) -> np.ndarray:
+    """Lorenz / Rossler attractor x-coordinate, normalised to 0..1."""
+    x, y, z = 0.1 + 0.01 * seed, 0.0, 0.0
+    out = np.empty(max(steps, 2))
+    for i in range(len(out)):
+        for _ in range(4):
+            if kind == "lorenz":
+                dx, dy, dz = 10 * (y - x), x * (28 - z) - y, x * y - 8 / 3 * z
+                h = dt * 0.01
+            else:
+                dx, dy, dz = -y - z, x + 0.2 * y, 0.2 + z * (x - 5.7)
+                h = dt * 0.05
+            x, y, z = x + h * dx, y + h * dy, z + h * dz
+        out[i] = x
+    lo, hi = out.min(), out.max()
+    return (out - lo) / (hi - lo + 1e-12)
+
+
+def render_lfo(lfo, tl: Timeline, bpm: float, index: int = 0) -> np.ndarray:
     rate = sync_to_hz(lfo.sync, bpm) if lfo.sync else lfo.rate_hz
-    if lfo.mode == "free":
-        ph = np.arange(tl.n) / tl.sr * rate + lfo.phase
+    t_abs = np.arange(tl.n) / tl.sr
+    t_rel = t_abs if lfo.mode == "free" else tl.t_on
+    ph = t_rel * rate + lfo.phase
+    if lfo.mode == "env":
+        ph = np.minimum(ph, 0.9999)
+    kind = getattr(lfo, "type", "shape")
+    if kind == "random":
+        cyc = np.floor(ph).astype(np.int64)
+        if lfo.mode != "free":
+            # a new random sequence per note
+            cyc = cyc + 1000 * np.maximum(tl.idx, 0)
+        v = ((cyc * 2654435761 + 97 * (index + 1)) % 1000003) / 1000003.0
+    elif kind in ("lorenz", "rossler"):
+        steps = int(tl.n / 64) + 2
+        traj = _chaos(kind, steps, rate / (tl.sr / 64), index)
+        v = np.interp(t_abs * tl.sr / 64, np.arange(steps), traj)
     else:
-        ph = tl.t_on * rate + lfo.phase
-        if lfo.mode == "env":
-            ph = np.minimum(ph, 0.9999)
-    return lfo_shape(lfo.shape, ph, lfo.points)
+        v = lfo_shape(lfo.shape, ph, lfo.points)
+    smooth = getattr(lfo, "smooth", 0.0)
+    if smooth > 0:
+        a = np.exp(-1.0 / (smooth * 0.25 * tl.sr))
+        v = signal.lfilter([1 - a], [1, -a], v, zi=[v[0] * a])[0]
+    rise, delay = getattr(lfo, "rise", 0.0), getattr(lfo, "delay", 0.0)
+    if rise > 0 or delay > 0:
+        g = (t_rel - delay) / rise if rise > 0 else (t_rel >= delay).astype(float)
+        v = v * np.clip(g, 0, 1)
+    return v
 
 
 # --------------------------------------------------------------------------
@@ -339,13 +393,72 @@ def _wt_lookup(table: np.ndarray, phase: np.ndarray, pos: np.ndarray) -> np.ndar
     return a * (1 - fj) + b * fj
 
 
-def unison_offsets(n: int, detune: float) -> tuple[np.ndarray, np.ndarray]:
-    """Semitone offsets and relative gains for n unison voices."""
+UNISON_STACKS = {"Octave1": [0, 12], "Octave2": [0, 12, 24], "Octave3": [0, 12, 24, 36],
+                 "OctaveFifth1": [0, 7, 12], "OctaveFifth2": [0, 7, 12, 19, 24],
+                 "OctaveFifth3": [0, 7, 12, 19, 24, 31, 36], "Center12": [0, 12]}
+
+
+def unison_offsets(n: int, detune: float, rng_semis: float = 2.0, stack: str = "none") -> tuple[np.ndarray, np.ndarray]:
+    """Semitone offsets and relative gains for n unison voices. ``rng_semis``
+    is Serum's unison range (spread at full detune); stacks add octaves/fifths."""
     if n <= 1:
         return np.zeros(1), np.ones(1)
-    spread = 1.0 * detune ** 1.5          # semitones at the outermost voice
+    spread = 0.5 * rng_semis * detune ** 1.5          # semitones at the outermost voice
     off = np.linspace(-1, 1, n) * spread
+    st = UNISON_STACKS.get(str(stack).replace("k", "", 1) if str(stack).startswith("k") else stack)
+    if st:
+        off = off + np.array([st[i % len(st)] for i in range(n)], dtype=float)
     return off, np.ones(n)
+
+
+PHASE_WARPS = ("Sync", "BendPos", "BendNeg", "BendPosNeg", "PWM", "ASYMPos", "ASYMNeg", "ASYMPosNeg",
+               "Quantize", "Mirror", "Remap_1", "Remap_2", "Remap_3", "Remap_4")
+LEGACY_WARPS = {"fm_b": "FM_OSC", "fm_sub": "FM_SUB", "am_b": "AM_OSC", "rm_b": "RM_OSC", "rm_sub": "RM_SUB"}
+
+
+def warp_code(w: str) -> str:
+    w = LEGACY_WARPS.get(w, w or "none")
+    return w[1:] if w.startswith("k") and w[1:2].isupper() else w
+
+
+def warp_source(code: str) -> str | None:
+    """Which signal a cross-modulation warp listens to."""
+    for suffix, src in (("_OSC2", "osc2"), ("_OSC", "osc"), ("_SUB", "sub"), ("_NOISE", "noise"),
+                        ("_FILT1", "osc"), ("_FILT2", "osc2")):
+        if code.endswith(suffix):
+            return src
+    return None
+
+
+def _warp_phase(frac, code, a):
+    """Phase-domain warps (frac in 0..1, amount a scalar or array)."""
+    if code == "Sync":
+        return np.mod(frac * (1 + a * 7), 1.0), None
+    if code in ("BendPos", "Remap_1"):
+        return frac ** (1 + 4 * a), None
+    if code in ("BendNeg", "Remap_2"):
+        return 1 - (1 - frac) ** (1 + 4 * a), None
+    if code == "BendPosNeg":
+        lo = frac < 0.5
+        f2 = np.where(lo, 0.5 * (2 * frac) ** (1 + 4 * a), 1 - 0.5 * (2 - 2 * frac) ** (1 + 4 * a))
+        return f2, None
+    if code == "PWM":
+        w = 1 - 0.98 * a
+        return np.minimum(frac / w, 0.999999), frac > w
+    if code.startswith("ASYM"):
+        d = 0.5 - 0.49 * a if code != "ASYMNeg" else 0.5 + 0.49 * a
+        if code == "ASYMPosNeg":
+            d = 0.5 - 0.49 * a * np.sign(np.sin(2 * np.pi * frac) + 1e-9)
+        return np.where(frac < d, frac * 0.5 / d, 0.5 + (frac - d) * 0.5 / (1 - d)), None
+    if code in ("Quantize", "Remap_4"):
+        nq = np.maximum(2.0, 256.0 * (1 - a) ** 2)
+        return np.floor(frac * nq) / nq, None
+    if code == "Mirror":
+        m = np.where(frac < 0.5, 2 * frac, 2 - 2 * frac)
+        return (1 - a) * frac + a * m * 0.5, None
+    if code == "Remap_3":
+        return np.mod(frac + a * np.sin(2 * np.pi * frac) / (2 * np.pi), 1.0), None
+    return frac, None
 
 
 class Renderer:
@@ -359,27 +472,52 @@ class Renderer:
                solo: str | None = None) -> np.ndarray:
         """Render notes through the patch. ``solo`` limits output to one part
         ("oscs", "noise", "sub") which the ablation checks use."""
+        from .dsp import process_chain
         sr = self.sr
         n = int(round(duration * sr))
         if n <= 0 or not notes:
             return np.zeros(max(n, 0), dtype=np.float32)
         voices = [notes] if patch.mono else [[nt] for nt in notes]
         out = np.zeros(n)
+        buses = [np.zeros(n), np.zeros(n)]
+        fx_mods = {}
         for vnotes in voices:
-            out += self._render_voice(patch, vnotes, n, solo)
+            main, b1, b2, fm = self._render_voice(patch, vnotes, n, solo)
+            out += main
+            buses[0] += b1
+            buses[1] += b2
+            for k, v in fm.items():
+                fx_mods[k] = v if k not in fx_mods else np.maximum(fx_mods[k], v)
         out = self._fx(patch, out)
+        out = process_chain(out, patch.fx_chain, sr, fx_mods)
+        for b in range(2):
+            if np.any(buses[b]):
+                lvl = patch.bus_levels[b] if b < len(patch.bus_levels) else 1.0
+                out += lvl * process_chain(buses[b], patch.fx_buses[b] if b < len(patch.fx_buses) else [],
+                                           sr, fx_mods, prefix=f"bus{b + 1}")
+        if not np.all(np.isfinite(out)):
+            out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
         return (out * patch.master).astype(np.float32)
 
     # ------------------------------------------------------------------
     def _mods(self, patch: Patch, tl: Timeline):
         srcs = {}
-        need = {m.source for m in patch.mods if m.amount}
+        need = {m.source for m in patch.mods if m.amount} | {m.aux for m in patch.mods if m.amount and m.aux}
         for i, e in enumerate(patch.envs):
             if i == 0 or f"env{i+1}" in need:
                 srcs[f"env{i+1}"] = render_env(e, tl)
         for i, l in enumerate(patch.lfos):
             if f"lfo{i+1}" in need:
-                srcs[f"lfo{i+1}"] = render_lfo(l, tl, patch.bpm)
+                srcs[f"lfo{i+1}"] = render_lfo(l, tl, patch.bpm, i)
+        if "velocity" in need:
+            srcs["velocity"] = tl.vel
+        if "note" in need:
+            srcs["note"] = np.clip((tl.pitch - 0) / 127.0, 0, 1)
+        if "modwheel" in need:
+            srcs["modwheel"] = np.zeros(tl.n)
+        for i, v in enumerate(patch.macros):
+            if f"macro{i+1}" in need:
+                srcs[f"macro{i+1}"] = np.full(tl.n, float(v))
         dest = {}
         for m in patch.mods:
             if not m.amount or m.source not in srcs:
@@ -387,80 +525,149 @@ class Renderer:
             v = srcs[m.source]
             if m.bipolar:
                 v = 2 * v - 1
-            dest[m.dest] = dest.get(m.dest, 0) + m.amount * v
+            if m.aux and m.aux in srcs:
+                v = v * srcs[m.aux]
+            d = "filter.cutoff" if m.dest == "filter1.cutoff" else m.dest
+            dest[d] = dest.get(d, 0) + m.amount * v
         return srcs, dest
+
+    def _noise(self, patch, n, rng):
+        nz = rng.standard_normal(n)
+        c = patch.noise.color
+        if c < 0.5:     # darker: one-pole low-pass
+            fc = 200 * 2 ** (c * 2 * 6.6)
+            a = np.exp(-2 * np.pi * fc / self.sr)
+            nz = signal.lfilter([1 - a], [1, -a], nz) * (1 + (0.5 - c) * 4)
+        elif c > 0.5:   # brighter: first-difference tilt
+            k = (c - 0.5) * 2
+            nz = (1 - k) * nz + k * np.diff(nz, prepend=0.0)
+        return 0.35 * nz
+
+    def _filter(self, f, key, x, dm, tl):
+        from .dsp import apply_filter_type
+        cut_oct = 10.0 * dm.get(f"{key}.cutoff", 0.0) + f.keytrack * (tl.pitch - 60) / 12
+        cutoff = f.cutoff * 2 ** np.asarray(cut_oct, dtype=float)
+        reso = float(np.clip(f.reso + np.mean(dm.get(f"{key}.reso", 0.0)), 0, 0.98))
+        drive = float(np.clip(f.drive + np.mean(dm.get(f"{key}.drive", 0.0)), 0, 1))
+        var = float(np.clip(f.var + np.mean(dm.get(f"{key}.var", 0.0)), 0, 1))
+        if f.type in ("lp12", "lp24", "hp12", "hp24", "bp12") and var == 0.5 and f.mix >= 1:
+            return apply_filter(x, f.type, np.broadcast_to(cutoff, x.shape).astype(float), reso, drive, self.sr)
+        return apply_filter_type(x, f.type, np.broadcast_to(cutoff, x.shape), reso, drive, var, self.sr, mix=f.mix)
 
     def _render_voice(self, patch: Patch, notes, n, solo):
         sr = self.sr
+        z = np.zeros(n)
         tl = Timeline(notes, n, sr, patch.glide if patch.mono else 0.0)
         if not tl.bounds:
-            return np.zeros(n)
+            return z, z, z, {}
         srcs, dm = self._mods(patch, tl)
         pitch = tl.pitch + 48.0 * dm.get("pitch", 0.0)
         rng = np.random.default_rng(self.seed)
-        x = np.zeros(n)
+        sources = {}            # name -> signal before filters
+        noise_sig = None
+        if patch.noise.enabled:
+            noise_sig = self._noise(patch, n, rng)
         if solo in (None, "oscs"):
             sub_sig = self._sub(patch, pitch) if patch.sub.enabled else None
-            raw = {}
-            # B and C first: they can be modulators for A's warp
-            for i in (1, 2, 0):
-                o = patch.oscs[i]
-                if not o.enabled:
-                    continue
-                mod_sig = None
-                if o.warp != "none" and o.warp_amount > 0:
-                    src = "sub" if o.warp.endswith("_sub") else ("b" if i != 1 else "a")
-                    mod_sig = sub_sig if src == "sub" else raw.get(1 if src == "b" else 0)
-                raw[i] = self._osc(o, pitch, dm.get(f"osc{i+1}.pos", 0.0), rng, tl, mod_sig)
+            # plain (unwarped) osc signals serve as modulators for cross-warps
+            plain = {}
+            needs = set()
+            for o in patch.oscs:
+                if o.enabled:
+                    for w, amt in ((o.warp, o.warp_amount), (o.warp2, o.warp2_amount)):
+                        src = warp_source(warp_code(w)) if amt else None
+                        if src in ("osc", "osc2"):
+                            needs.add(src)
+            for i, o in enumerate(patch.oscs):
+                if o.enabled and needs:
+                    plain[i] = self._osc(o, pitch, dm.get(f"osc{i+1}.pos", 0.0), rng, tl, plain_only=True)
             for i, o in patch.active_oscs():
+                others = [j for j in (0, 1, 2) if j != i]
+                mod_sigs = {"osc": plain.get(others[0]), "osc2": plain.get(others[1]), "sub": sub_sig,
+                            "noise": noise_sig if noise_sig is not None else rng.standard_normal(n) * 0.35}
                 lvl = np.clip(o.level + dm.get(f"osc{i+1}.level", 0.0), 0, 1.5)
-                if np.all(lvl == 0) or i not in raw:
+                if np.all(lvl == 0):
                     continue
-                x += lvl * raw[i]
-            if patch.sub.enabled and sub_sig is not None and patch.sub.level > 0:
-                x += patch.sub.level * sub_sig
-        if patch.noise.enabled and solo in (None, "noise"):
-            nz = rng.standard_normal(n)
-            c = patch.noise.color
-            if c < 0.5:     # darker: one-pole low-pass
-                fc = 200 * 2 ** (c * 2 * 6.6)
-                a = np.exp(-2 * np.pi * fc / sr)
-                nz = signal.lfilter([1 - a], [1, -a], nz) * (1 + (0.5 - c) * 4)
-            elif c > 0.5:   # brighter: first-difference tilt
-                k = (c - 0.5) * 2
-                nz = (1 - k) * nz + k * np.diff(nz, prepend=0.0)
+                sig = self._osc(o, pitch, dm.get(f"osc{i+1}.pos", 0.0), rng, tl, mod_sigs=mod_sigs,
+                                warp_mod=(dm.get(f"osc{i+1}.warp", 0.0), dm.get(f"osc{i+1}.warp2", 0.0)),
+                                fine_mod=dm.get(f"osc{i+1}.fine", 0.0))
+                sources[f"osc{i+1}"] = lvl * sig
+            if sub_sig is not None and patch.sub.level > 0:
+                sources["sub"] = np.clip(patch.sub.level + dm.get("sub.level", 0.0), 0, 1.5) * sub_sig
+        if noise_sig is not None and solo in (None, "noise"):
             nl = np.clip(patch.noise.level + dm.get("noise.level", 0.0), 0, 1.5)
-            x += nl * 0.35 * nz
-        f = patch.filter
-        if f.enabled:
-            cut_oct = 10.0 * dm.get("filter.cutoff", 0.0) + f.keytrack * (tl.pitch - 60) / 12
-            cutoff = f.cutoff * 2 ** cut_oct if np.ndim(cut_oct) else np.full(n, f.cutoff * 2 ** cut_oct)
-            reso = float(np.clip(f.reso + np.mean(dm.get("filter.reso", 0.0)), 0, 0.98))
-            x = apply_filter(x, f.type, np.asarray(cutoff, dtype=float), reso, f.drive, sr)
+            sources["noise"] = nl * noise_sig
+        # routing: each source -> filter 1 / filter 2 (balance) / direct, + bus sends
+        f1_in, f2_in, direct = np.zeros(n), np.zeros(n), np.zeros(n)
+        b1, b2 = np.zeros(n), np.zeros(n)
+        f1_on, f2_on = patch.filter.enabled, patch.filter2.enabled
+        for name, sig in sources.items():
+            r = patch.route(name)
+            if r["dest"] == "none":
+                continue
+            if r["dest"] == "filter" and (f1_on or f2_on):
+                bal = float(np.clip(r["balance"], 0, 1)) if (f1_on and f2_on) else (0.0 if f1_on else 1.0)
+                f1_in += (1 - bal) * sig
+                f2_in += bal * sig
+            else:
+                direct += sig
+            if r.get("send1"):
+                b1 += r["send1"] * sig
+            if r.get("send2"):
+                b2 += r["send2"] * sig
+        x = direct
+        if f1_on:
+            x = x + self._filter(patch.filter, "filter", f1_in, dm, tl)
+        elif np.any(f1_in):
+            x = x + f1_in
+        if f2_on:
+            x = x + self._filter(patch.filter2, "filter2", f2_in, dm, tl)
+        elif np.any(f2_in):
+            x = x + f2_in
         amp = srcs["env1"] * tl.vel * np.clip(1.0 + dm.get("amp", 0.0), 0, 4)
-        return x * amp
+        fx_mods = {k: v for k, v in dm.items() if k.startswith(("fx.", "bus1.", "bus2."))}
+        if "dist.drive" in dm:
+            fx_mods["legacy.drive"] = dm["dist.drive"]
+        return x * amp, b1 * amp, b2 * amp, fx_mods
 
     def _sub(self, patch, pitch):
         s = patch.sub
         tid = {"sine": "basic:sine", "triangle": "basic:triangle", "saw": "basic:saw",
-               "square": "basic:square"}.get(s.shape, "basic:sine")
+               "square": "basic:square", "pulse": "basic:pwm", "roundrect": "basic:square"}.get(s.shape, "basic:sine")
         f = 440.0 * 2 ** ((pitch + 12 * s.octave - 69) / 12)
         tab = self.bank.mip(tid, _mip_level(float(f.max()), self.sr))
-        return _wt_lookup(tab, np.cumsum(f / self.sr), np.zeros(1))
+        pos = np.full(1, 0.7 if s.shape == "pulse" else 0.0)
+        y = _wt_lookup(tab, np.cumsum(f / self.sr), pos)
+        if s.shape == "roundrect":
+            y = np.tanh(2.5 * y) / np.tanh(2.5)
+        return y
 
-    def _osc(self, o, pitch, posmod, rng, tl=None, mod_sig=None):
+    def _osc(self, o, pitch, posmod, rng, tl=None, mod_sigs=None, warp_mod=(0.0, 0.0), fine_mod=0.0,
+             plain_only=False):
         sr = self.sr
-        base = pitch + 12 * o.octave + o.semi + o.fine / 100.0
-        offs, gains = unison_offsets(max(1, int(o.unison)), o.detune)
+        base = pitch + 12 * o.octave + o.semi + (o.fine + 100.0 * np.asarray(fine_mod)) / 100.0
+        offs, gains = unison_offsets(max(1, int(o.unison)), o.detune, getattr(o, "unison_range", 2.0),
+                                     getattr(o, "unison_stack", "none"))
         if len(gains) > 1:
             gains = np.where(np.abs(np.linspace(-1, 1, len(gains))) < 0.34, 1.0, o.blend)
         f_max = 440.0 * 2 ** ((float(np.max(base)) + offs.max() - 69) / 12)
         tab = self.bank.mip(o.table, _mip_level(f_max, sr))
         pos = np.clip(o.position + posmod, 0, 1) if np.ndim(posmod) else np.array([np.clip(o.position + posmod, 0, 1)])
+        posarg = pos if pos.size > 1 else np.full(1, pos[0])
+        warps = [] if plain_only else [
+            (warp_code(o.warp), np.clip(o.warp_amount + warp_mod[0], 0, 1)),
+            (warp_code(o.warp2), np.clip(o.warp2_amount + warp_mod[1], 0, 1))]
+        warps = [(c, a) for c, a in warps if c != "none" and np.any(np.asarray(a) > 0)]
+        mod_sigs = mod_sigs or {}
         out = 0.0
         starts = [b[0] for b in tl.bounds] if tl is not None else [0]
         for off, g in zip(offs, gains):
             f = 440.0 * 2 ** ((base + off - 69) / 12)
+            for code, a in warps:          # exponential FM changes the frequency itself
+                if code.startswith("FMX"):
+                    src = mod_sigs.get(warp_source(code))
+                    if src is not None:
+                        f = f * 2 ** (a * 2.0 * src)
             ph = np.cumsum(f / sr)
             # phase restarts at every note-on (Serum's default retrigger), at
             # `phase` plus an optional random offset per note
@@ -470,15 +677,48 @@ class Renderer:
                 base_ph = ph[s0 - 1] if s0 > 0 else 0.0
                 offset[s0:s1] = -base_ph + o.phase + o.random_phase * rng.random()
             ph = ph + offset
-            if mod_sig is not None and o.warp.startswith("fm"):
-                # Serum-style FM = phase modulation by the modulator signal
-                ph = ph + o.warp_amount * FM_INDEX * mod_sig
-            out = out + g * _wt_lookup(tab, ph, pos if pos.size > 1 else np.full(1, pos[0]))
-        out = out / np.sqrt(np.sum(np.square(gains)))
-        if mod_sig is not None and o.warp.startswith("am"):
-            out = out * ((1 - o.warp_amount) + o.warp_amount * (0.5 + 0.5 * mod_sig))
-        elif mod_sig is not None and o.warp.startswith("rm"):
-            out = out * ((1 - o.warp_amount) + o.warp_amount * mod_sig)
+            mask = None
+            for code, a in warps:
+                src = mod_sigs.get(warp_source(code))
+                if code.startswith(("FM_", "FMP_")) and src is not None:
+                    ph = ph + a * FM_INDEX * src           # Serum FM = phase modulation
+                elif code.startswith("PD_") and src is not None:
+                    ph = ph + a * 0.5 * (0.5 + 0.5 * src)  # unipolar phase distortion
+            frac = np.mod(ph, 1.0)
+            for code, a in warps:
+                if code in PHASE_WARPS:
+                    frac, m = _warp_phase(frac, code, a)
+                    if m is not None:
+                        mask = m if mask is None else (mask | m)
+            v = _wt_lookup(tab, frac, posarg)
+            for code, a in warps:
+                if code == "SelfPD":
+                    v = _wt_lookup(tab, np.mod(frac + a * 0.25 * v, 1.0), posarg)
+                elif code == "EvenOdd":
+                    v2 = _wt_lookup(tab, np.mod(frac + 0.5, 1.0), posarg)
+                    even, odd = 0.5 * (v + v2), 0.5 * (v - v2)
+                    v = 2 * (1 - a) * even + 2 * a * odd
+                elif code == "Flip":
+                    v = np.where(frac > 1 - a, -v, v)
+            if mask is not None:
+                v = np.where(mask, 0.0, v)
+            out = out + g * v
+        out = out / max(float(np.sqrt(np.sum(np.square(gains)))), 1e-9)
+        for code, a in warps:              # output-domain warps
+            src = mod_sigs.get(warp_source(code))
+            if code.startswith("AM_") and src is not None:
+                out = out * ((1 - a) + a * (0.5 + 0.5 * src))
+            elif code.startswith("RM_") and src is not None:
+                out = out * ((1 - a) + a * src)
+            elif code.startswith("Dist"):
+                from .dsp import shape
+                out = shape(out, code, float(np.mean(a)))
+            elif code == "FilterLPF":
+                from .dsp import onepole_lp
+                out = onepole_lp(out, 20 * 1000 ** (1 - np.asarray(a, dtype=float)), sr)
+            elif code == "FilterHPF":
+                from .dsp import onepole_lp
+                out = out - onepole_lp(out, 20 * 1000 ** np.asarray(a, dtype=float), sr)
         return out
 
     def _fx(self, patch: Patch, x):

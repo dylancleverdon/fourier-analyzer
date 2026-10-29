@@ -33,7 +33,7 @@ import numpy as np
 
 from ..analysis.features import Analysis
 from ..synth.engine import Renderer
-from ..synth.patch import (LFO, Distortion, EQ, Env, Filter, Mod, NoiseOsc, OTT, Osc, Patch,
+from ..synth.patch import (fx as fx_module, LFO, Distortion, EQ, Env, Filter, Mod, NoiseOsc, OTT, Osc, Patch,
                            SubOsc)
 from ..synth.wavetables import StockIndex, TableBank, custom_table_from_harmonics
 from . import params as P
@@ -387,6 +387,73 @@ class Optimizer:
                         q.filter.type = ft
                         return q
                     mv(f"filter type {ft}", f, {"filter"})
+        # --- Serum 2 extras: phase warps, warp slot 2, unison stacks --------
+        if o0.warp == "none":
+            for code in ("Sync", "BendPos", "BendNeg", "PWM", "ASYMPos", "Mirror", "Quantize", "SelfPD",
+                         "EvenOdd", "Flip", "DistSoft"):
+                def f(q, code=code):
+                    q.oscs[0].warp, q.oscs[0].warp_amount = code, 0.3
+                    return q
+                mv(f"warp {code} on osc A", f, {"osc"})
+        elif o0.warp2 == "none":
+            for code in ("Sync", "BendPos", "SelfPD", "DistSoft", "Mirror"):
+                if code == o0.warp:
+                    continue
+
+                def f(q, code=code):
+                    q.oscs[0].warp2, q.oscs[0].warp2_amount = code, 0.3
+                    return q
+                mv(f"second warp {code} on osc A", f, {"osc"})
+        if o0.unison > 1 and o0.unison_stack == "none":
+            for stack in ("Octave1", "OctaveFifth1", "Center12"):
+                def f(q, stack=stack):
+                    q.oscs[0].unison_stack = stack
+                    return q
+                mv(f"unison stack {stack}", f, {"osc"})
+        # --- Serum filter models ---------------------------------------------
+        if p.filter.enabled:
+            for ft in ("Ladder24", "Comb+", "Phase+", "Flange+", "FormantI", "Diffuser", "Scream24", "LNH12"):
+                if ft != p.filter.type:
+                    def f(q, ft=ft):
+                        q.filter.type, q.filter.var = ft, 0.5
+                        return q
+                    mv(f"filter type {ft}", f, {"filter"})
+            if not p.filter2.enabled:
+                for ft, cut in (("lp24", 6000.0), ("hp12", 80.0), ("Comb+", 800.0)):
+                    def f(q, ft=ft, cut=cut):
+                        q.filter2 = Filter(enabled=True, type=ft, cutoff=cut, reso=0.1)
+                        for src in ("osc1", "osc2", "osc3", "noise", "sub"):
+                            q.routing.setdefault(src, {})["balance"] = 0.5
+                        return q
+                    mv(f"filter 2 in parallel ({ft})", f, {"filter"})
+        # --- FX rack modules ---------------------------------------------------
+        have = {m.get("type") for m in p.fx_chain}
+        cand = [("chorus", {}), ("flanger", {}), ("phaser", {}), ("hyperdim", {}), ("bode", {"shift_hz": 30.0}),
+                ("filter", {"ftype": "L24", "cutoff": 6000.0}), ("comp", {"multiband": False}),
+                ("distortion", {"mode": "Tube"}), ("distortion", {"mode": "Diode1"}),
+                ("distortion", {"mode": "Asym"})]
+        beat = 60.0 / max(p.bpm, 1.0)
+        # time-based effects are always screened: their tails usually end up
+        # inside the segmented notes, so the analysis can't flag them reliably
+        cand += [("reverb", {"kind": "Hall"}), ("reverb", {"kind": "Plate", "decay": 0.8}),
+                 ("convolve", {}), ("delay", {"time": beat / 4, "time2": beat / 4}),
+                 ("delay", {"time": beat * 3 / 8, "time2": beat * 3 / 8})]
+        if len(p.fx_chain) < 8:
+            for kind, kw in cand:
+                if kind in have and kind != "distortion":
+                    continue
+
+                def f(q, kind=kind, kw=kw):
+                    q.fx_chain.append(fx_module(kind, **kw))
+                    return q
+                extra = kw.get("mode") or kw.get("kind") or ""
+                mv(f"FX {kind}{' ' + extra if extra else ''}", f, {"fx"})
+        if len(p.fx_chain) == 1 and p.fx_chain[0].get("type") == "distortion":
+            def f(q):
+                d = q.fx_chain.pop(0)
+                q.fx_chain.append(fx_module("split", freq=250.0, bands=[[], [d]]))
+                return q
+            mv("multiband split: distort highs only", f, {"fx"})
         if p.mono and p.glide == 0 and len(self.notes) > 1:
             def f(q):
                 q.glide = 0.03
@@ -423,6 +490,24 @@ class Optimizer:
             mv("OTT", lambda q: (setattr(q.ott, "enabled", False), q)[1])
         if p.eq.enabled:
             mv("EQ", lambda q: (setattr(q.eq, "enabled", False), q)[1])
+        if p.oscs[0].warp2 != "none":
+            def drop_w2(q):
+                q.oscs[0].warp2, q.oscs[0].warp2_amount = "none", 0.0
+                return q
+            mv(f"{p.oscs[0].warp2} warp 2", drop_w2)
+        if p.filter2.enabled:
+            def drop_f2(q):
+                q.filter2.enabled = False
+                for r in q.routing.values():
+                    r["balance"] = 0.0
+                return q
+            mv("filter 2", drop_f2)
+        for j, m in enumerate(p.fx_chain):
+            def drop_fx(q, j=j):
+                q.fx_chain.pop(j)
+                q.mods = [x for x in q.mods if not x.dest.startswith("fx.")]
+                return q
+            mv(f"FX {m.get('type')}", drop_fx)
         for j, m in enumerate(p.mods):
             mv(f"mod {m.source}->{m.dest}", lambda q, j=j: (q.mods.pop(j), q)[1])
         if p.filter.enabled and not any(m.dest.startswith("filter") for m in p.mods):
@@ -460,13 +545,21 @@ class Optimizer:
                 break
             moves = self.structure_moves(p)
             self.set_stage("structure", f"screening {len(moves)} possible additions")
-            # cheap screen: a short tune of only the new component's params
-            screened = []
+            # quick screen: one render per candidate so every move gets a look
+            # however many there are, then a short tune of the top dozen
+            quick = []
             for name, fn, focus in moves:
                 if self.time_left() < opts.time_budget * 0.3:
                     break
                 self.activity = f"screening: {name}"
                 q = fn(p.copy())
+                quick.append((self.evaluate(q), name, q, focus))
+            quick.sort(key=lambda r: -r[0])
+            screened = []
+            for _, name, q, focus in quick[:12]:
+                if self.time_left() < opts.time_budget * 0.3:
+                    break
+                self.activity = f"short tune: {name}"
                 q, s = self.tune(q, 12, focus=focus, sigma=0.2)
                 screened.append((s, name, q, focus))
             screened.sort(key=lambda r: -r[0])
