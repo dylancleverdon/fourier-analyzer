@@ -61,7 +61,18 @@ There is deliberately no signing or checksum verification; update speed was prio
       - OTT, EQ and glide
    3. **Pruning** removes each component in turn and drops it if the fit holds.
    4. **Fine-tuning** of every parameter with CMA-ES.
-   5. **Waveform alignment**: start phase, fine tune, the amp envelope and each note's start time (±6 ms) are tuned to maximise literal waveform correlation. The refined note timing also goes into the exported MIDI.
+   5. **Exploration** (search times over 15 min): after the first full pass (about 15 min), the search keeps experimenting until the time runs out: fresh rounds of structure moves, pruning and CMA-ES restarts, keeping only what improves the fit.
+   6. **Waveform alignment**: start phase, fine tune, the amp envelope and each note's start time (±6 ms) are tuned to maximise literal waveform correlation. The refined note timing also goes into the exported MIDI.
+
+   **Search time** goes from 1.5 min to 8 hours, a custom number of minutes, or **Until I stop it**. Tick **keep improving after reaching the target** so a long run doesn't stop at the similarity target.
+
+   **Pitch and velocity go into the patch** where Serum would put them:
+   - vibrato or wobble becomes an LFO → Main Tuning (tempo synced);
+   - a pitch drop or rise at each note start becomes an envelope → Main Tuning;
+   - glide becomes legato portamento;
+   - velocity drives Voice Amp through a velocity curve.
+
+   Pitch movement explained by the patch is removed from the MIDI bends. One-off bends stay in the MIDI.
 5. **Verification checks** ("check your work"):
    - The original is split into its tonal part and noise residual, and those are compared with the patch's oscillators alone and noise alone.
    - Each patch component is removed in turn to measure what it contributes.
@@ -83,7 +94,15 @@ Kick times come from the separated kick stem, or the beat grid if there is no ki
 When ducking is found:
 - it is **divided out before the analysis**, so it isn't mistaken for an amp envelope or LFO;
 - it is **re-applied to every render before comparing**, so the patch is judged as it sounds in the track;
-- the result shows matching **Logic Compressor sidechain settings**, because the ducking lives in the DAW, not in Serum.
+- the result shows matching **Logic Compressor sidechain settings**, because the ducking usually lives in the DAW;
+- the preset gets a tempo-synced LFO → Voice Amp shaped like the ducking. Its matrix slot is **bypassed** unless you tick **put detected sidechain ducking into the preset**, in which case it ducks inside Serum.
+
+### Running jobs
+
+- **Multiple windows.** **New window** (or ⌘N) opens another analyzer window. Each window can work on its own track, and up to 4 jobs run at once (setting `parallel_jobs`).
+- **Cancel.** A running separation or layer split can be cancelled. **Stop (keep best)** ends a reconstruction early: it finishes a short alignment and exports the best patch found so far.
+- **Clip first.** **Separate selection** separates only the part you selected, so long songs don't have to be separated in full.
+- **Player.** Playback uses Web Audio, so it starts on the first sample and the playhead follows the audio clock.
 
 ### Similarity metrics (objective)
 
@@ -102,23 +121,42 @@ Waveform similarity is phase sensitive. Sounds with random-phase unison, noise o
 
 ### Serum 2 feature coverage
 
-The patch model, renderer and preset mapping cover:
-- 3 wavetable oscillators plus noise and sub (pulse and round-rect too)
-- both warp slots per oscillator, with every warp mode
-- unison with detune, blend, range and stacks
-- start phase and random phase
-- both filters with the full Serum filter list, split into about 20 rendered families, with per-source routing (filter balance, direct out and FX bus sends)
-- 4 envelopes with curve shapes
-- 10 LFOs: shapes, custom curved points, S&H random, Lorenz and Rössler chaos, rise, delay and smooth
+The patch model, renderer and preset mapping follow the Serum 2 user guide.
+
+**Oscillators**
+- 3 oscillators in every mode: wavetable, sample (loop modes, crossfade, scan), granular (window shapes, density, spawn patterns, randomisation), spectral (resynthesis, band limits, spectral filter and warps) and multisample (SFZ)
+- pitch modes, ratio, Hz offset, pitch and bend tracking, key and velocity ranges
+- both warp slots with every warp mode, plus remap curves
+- unison: every mode, stacks, width, wavetable position and warp spread
+- start phase, phase memory and random phase
+- noise oscillator (colours, samples, one-shot, keytrack) and sub
+
+**Filters and routing**
+- both filters with the full Serum filter list (97 types in about 20 rendered families), with level, pan and the XY morph
+- per-source routing: filter balance, filter → filter, direct out and FX bus sends
+
+**Modulation**
+- 4 envelopes with curves, start/end levels and legato
+- 10 LFOs: shapes, custom paths, loopback, direction, swing, point modulation, S&H random, chaos, rise, delay and smooth
 - 8 macros
-- a 64-slot mod matrix with aux sources
-- the main FX rack and both FX buses, with all 16 module types, including nested 2-band, 3-band and mid/side splitters
+- a 64-slot mod matrix with aux sources, curves, slew and bypass; any parameter is a destination
+- velocity and note curves, Voice Amp
 
-Any Serum 2 preset can be imported. All 701 test presets load and render.
+**Voicing and playback**
+- mono, legato, poly limits, glide curve, always and scaled
+- pitch quantiser and scales, tuning tables, Main Tuning
+- the arpeggiator and clip player
 
-What is **not emulated**:
-- sample, granular, spectral and multisample oscillators. Their source files aren't in the preset, so the reconstruction rebuilds those sounds with custom wavetables instead.
-- the arpeggiator and clip player. Use the exported MIDI.
+**FX**
+- the main FX rack and both FX buses with all module types and their full parameter sets, including nested 2-band, 3-band and mid/side splitters
+
+Any Serum 2 preset can be imported and re-exported unchanged; settings that aren't interpreted are passed through. All 701 test presets load, render and round-trip.
+
+**Limits**
+- Factory samples, multisamples, noises and IRs are rendered only when Serum's content folder is installed (`/Library/Audio/Presets/Xfer Records/Serum 2 Presets`). User samples are embedded in the preset.
+- The reconstruction builds its oscillators from **custom wavetables** (as required); the other oscillator types are used when importing presets.
+- The arpeggiator's Pattern mode is approximated.
+- Some modulation source IDs (aftertouch, poly aftertouch, random, alternate, pitch bend) are inferred, not confirmed against Serum.
 
 The FX and filter DSP reproduces how each module behaves, not Serum's exact algorithms. Calibrate against the real Serum check.
 
@@ -136,7 +174,8 @@ These come straight from Serum's own presets:
 
 These are **assumptions**:
 - the filter cutoff curve
-- coarse-pitch modulation depth
+- coarse-pitch modulation depth (±48 st) and the Main Tuning range (±24 st)
+- the units of synced LFO rates, module output levels and the compressor threshold
 - the unison detune curve
 - FM depth at 100 % warp (`FM_INDEX` in the renderer)
 

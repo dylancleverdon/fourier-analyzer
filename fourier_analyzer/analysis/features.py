@@ -39,6 +39,11 @@ class Analysis:
     percussive: bool
     lfo: dict | None                   # {feature, period_s, sync, shape_points, depth, mode}
     grid: dict = field(default_factory=dict)   # timing report
+    # pitch movement that belongs in the patch rather than in MIDI bends
+    pitch_lfo: dict | None = None      # vibrato / synced pitch wobble: detect_lfo() + depth in semitones
+    pitch_env: dict | None = None      # recurring per-note pitch sweep: {semis, decay_s}
+    glide: float = 0.0                 # portamento time between legato notes (s)
+    notes_raw: list | None = None      # notes with their full measured bends
     spectrum_db: np.ndarray | None = None      # long term average spectrum (for UI)
     spectrum_hz: np.ndarray | None = None
 
@@ -53,6 +58,9 @@ class Analysis:
             "envelope": {k: round(v, 4) for k, v in self.env.items()},
             "percussive": self.percussive,
             "lfo": self.lfo,
+            "pitch_lfo": self.pitch_lfo,
+            "pitch_env": self.pitch_env,
+            "glide": round(self.glide, 4),
             "timing": self.grid,
             "top_harmonics_db": [round(float(x), 1) for x in self.harm_profile_db[:16]],
         }
@@ -256,15 +264,24 @@ def harmonics(Sx: np.ndarray, f0: np.ndarray, sr: int, n_harm: int = N_HARM):
 
 
 def _refine_onset(y, sr, t):
-    """Move an onset to the steepest short-window energy rise near t."""
+    """Move an onset to where the energy starts rising into the attack near t.
+    The frame-level detector can fire up to one loudness window (~46 ms)
+    early, so the search reaches forward that far."""
     w = 64
-    i0 = max(0, int((t - 0.015) * sr))
-    i1 = min(len(y) - w, int((t + 0.015) * sr))
+    i0 = max(0, int((t - 0.02) * sr))
+    i1 = min(len(y) - w, int((t + 0.06) * sr))
     if i1 <= i0 + w:
         return t
     seg = y[i0:i1 + w] ** 2
     e = np.convolve(seg, np.ones(w) / w, mode="valid")
+    k_max = int(np.argmax(e))
+    thr = 0.03 * e[k_max]                       # -15 dB below the attack peak
+    quiet = np.nonzero(e[:k_max + 1] < thr)[0]
+    if len(quiet):                              # attack out of (near) silence
+        return (i0 + int(quiet[-1]) + 1) / sr
+    # retrigger inside a sounding note: steepest rise among loud frames
     d = np.diff(10 * np.log10(e + 1e-10))
+    d[e[1:] < 0.1 * e[k_max]] = -np.inf
     return (i0 + int(np.argmax(d))) / sr
 
 
@@ -277,6 +294,8 @@ def _segment_notes(y, sr, f0, conf, times, rms_db, percussive_hint):
     with np.errstate(invalid="ignore", divide="ignore"):
         midi = np.where(np.isfinite(f0), 12 * np.log2(np.maximum(f0, 1e-3) / 440.0) + 69, np.nan)
     bounds = [0] if active[0] else []
+    pitch_bounds = set()
+    refine_ok = set()
     for i in range(1, n):
         if not active[i]:
             continue
@@ -304,7 +323,24 @@ def _segment_notes(y, sr, f0, conf, times, rms_db, percussive_hint):
                 prev_ok = not np.isfinite(midi[i - 1]) or abs(midi[i - 1] - mb) < 0.5
                 cur_new = not np.isfinite(midi[i]) or abs(midi[i] - mb) > 0.5
                 if abs(jump) > 0.8 and steady and prev_ok and cur_new:
-                    bounds.append(i)
+                    # a legato note starts where the pitch leaves the old note
+                    # (a glide), not where it arrives
+                    j = i
+                    target = mb + jump
+                    margin = max(0.25, 0.05 * abs(jump))
+                    while j - 1 > (bounds[-1] if bounds else 0) and active[j - 1] and np.isfinite(midi[j - 1]) \
+                            and rms_db[j - 1] > rms_db[i] - 10 \
+                            and min(mb, target) + margin < midi[j - 1] < max(mb, target) and i - j < 12:
+                        j -= 1
+                    bounds.append(j)
+                    pitch_bounds.add(j)
+                    if j == i:
+                        refine_ok.add(j)
+    # a pitch change right before a real attack is the old note's fading tail
+    bounds = sorted(set(bounds))
+    bounds = [b for k, b in enumerate(bounds)
+              if not (b in pitch_bounds and k + 1 < len(bounds) and bounds[k + 1] not in pitch_bounds
+                      and times[bounds[k + 1]] - times[b] < 0.08)]
     # merge boundaries closer than 40 ms
     merged = []
     for b in bounds:
@@ -318,7 +354,7 @@ def _segment_notes(y, sr, f0, conf, times, rms_db, percussive_hint):
         if len(seg_active) == 0:
             continue
         last = b + int(seg_active[-1])
-        t0 = _refine_onset(y, sr, float(times[b])) if b > 0 else 0.0
+        t0 = (_refine_onset(y, sr, float(times[b])) if (b not in pitch_bounds or b in refine_ok) else float(times[b])) if b > 0 else 0.0
         t_next = times[e_lim] if e_lim < n else dur_total
         t_end = min(float(times[last]) + HOP / sr, t_next)
         dur = max(t_end - t0, 0.02)
@@ -332,8 +368,8 @@ def _segment_notes(y, sr, f0, conf, times, rms_db, percussive_hint):
             pitch = float(np.median(track[min(2, len(track) - 1):third]))
             rel = track - pitch
             from scipy.ndimage import median_filter
-            sm = median_filter(rel, size=5, mode="nearest")
-            if (np.abs(sm) > 0.5).sum() >= 4 and not percussive_hint:
+            sm = median_filter(rel, size=3, mode="nearest")
+            if (np.abs(sm) > 0.12).sum() >= 4 and not percussive_hint:
                 rel = sm
                 tt = times[b:last + 1][good] - t0
                 step = max(1, int(0.02 / (HOP / sr)))
@@ -494,6 +530,9 @@ def detect_lfo(times, feature: np.ndarray, notes, bpm, name: str):
         ac /= ac[0] + 1e-12
         lo = max(2, int(0.03 / dt))
         hi = min(len(ac) - 1, int(len(x) * 0.6))
+        neg = np.nonzero(ac[1:hi] < 0)[0]
+        if len(neg):                       # skip the zero-lag lobe
+            lo = max(lo, int(neg[0]) + 1)
         if hi <= lo:
             continue
         k = lo + int(np.argmax(ac[lo:hi]))
@@ -516,7 +555,9 @@ def detect_lfo(times, feature: np.ndarray, notes, bpm, name: str):
         period = 1.0 / sync_to_hz(sync, bpm)
     # fold the feature into one cycle (aligned to note start => trig mode)
     x = best["x"]
-    ph = ((np.arange(len(x)) * dt) / period) % 1.0
+    # phase relative to the note start, so the shape lines up with a retriggered LFO
+    t_rel = times[best["i0"]: best["i0"] + len(x)] - best["note"].start
+    ph = (t_rel / period) % 1.0
     bins = np.linspace(0, 1, 17)
     cyc = np.array([x[(ph >= a) & (ph < b)].mean() if np.any((ph >= a) & (ph < b)) else np.nan
                     for a, b in zip(bins[:-1], bins[1:])])
@@ -534,6 +575,153 @@ def detect_lfo(times, feature: np.ndarray, notes, bpm, name: str):
                          for a, b in zip(np.linspace(0, 1, len(pts) + 1)[:-1], pts)],
         "mode": "trig",
     }
+
+
+def _note_rel_tracks(notes, times, f0):
+    """Per note: (frame times relative to the note start, pitch relative to
+    the note pitch in semitones) from the f0 track."""
+    with np.errstate(invalid="ignore", divide="ignore"):
+        midi = np.where(np.isfinite(f0), 12 * np.log2(np.maximum(f0, 1e-3) / 440.0) + 69, np.nan)
+    out = []
+    for n in notes:
+        i0, i1 = np.searchsorted(times, [n.start, n.start + n.duration])
+        seg = midi[i0:i1]
+        good = np.isfinite(seg)
+        idx = np.arange(i0, i1)[good]
+        tt = times[idx] - n.start
+        rel = seg[good] - n.pitch
+        ok = np.abs(rel) < 24
+        out.append((tt[ok], rel[ok], idx[ok]))
+    return out
+
+
+def _pitch_movement(notes, times, f0, bpm):
+    """Pitch movement a Serum patch would make itself: an LFO on pitch
+    (vibrato, synced wobbles), a pitch envelope that repeats on every note,
+    and portamento between legato notes."""
+    tracks = _note_rel_tracks(notes, times, f0)
+    # --- periodic pitch modulation (LFO -> Main Tuning) -----------------------
+    feat = np.zeros(len(times))
+    for n, (tt, rel, idx) in zip(notes, tracks):
+        if len(tt):
+            # unvoiced frames inside the note take the neighbouring value
+            seg = np.interp(np.arange(idx[0], idx[-1] + 1), idx, rel)
+            feat[idx[0]:idx[-1] + 1] = seg
+    pitch_lfo = detect_lfo(times, feat, notes, bpm, "pitch")
+    if pitch_lfo is not None:
+        # depth in semitones: peak-to-peak of the folded cycle
+        if pitch_lfo["depth"] < 0.08 or pitch_lfo["strength"] < 0.45:
+            pitch_lfo = None
+        else:
+            pitch_lfo["semis"] = round(float(pitch_lfo["depth"]), 3)
+    # --- recurring pitch sweep at the note start (Env -> Main Tuning) ---------
+    starts = []
+    for tt, rel, _ in tracks:
+        late = rel[(tt > 0.25) & (tt < 0.6)]
+        base = float(np.median(late)) if len(late) else 0.0
+        head = (tt < 0.15)
+        if head.sum() >= 3 and len(rel) >= 6:
+            hv = rel[head] - base
+            if np.all(np.sign(hv) == np.sign(hv[0])) and abs(hv[0]) > 0.2:
+                # exponential sweep: extrapolate log|offset| back to t = 0
+                sl, ic = np.polyfit(tt[head], np.log(np.abs(hv) + 1e-6), 1)
+                a0 = float(np.sign(hv[0]) * np.exp(ic)) if sl < 0 else float(hv[0])
+            else:
+                a0 = float(hv[0])
+            starts.append((a0 + base, base, tt, rel))
+    pitch_env = None
+    big = [s for s in starts if abs(s[0] - s[1]) > 1.0]
+    if len(starts) >= 2 and len(big) >= 0.6 * len(starts):
+        sgn = np.sign(np.median([s[0] for s in big]))
+        if all(np.sign(s[0]) == sgn for s in big):
+            semis = float(np.median([s[0] for s in big]))
+            # decay: time until the sweep has fallen to 1/e of its start
+            taus = []
+            for a0, _, tt, rel in big:
+                below = np.nonzero(np.abs(rel) < abs(a0) / np.e)[0]
+                if len(below):
+                    taus.append(float(tt[below[0]]))
+            if taus:
+                tau = float(np.median(taus))
+                # the long analysis window averages the first ~90 ms: fast sweeps
+                # read smaller than they are; the optimizer tunes depth and time
+                smear = float(np.clip(0.093 / max(tau, 0.01), 1.0, 3.0))
+                pitch_env = {"semis": round(semis * smear, 3), "decay_s": round(tau * 4.6 / smear, 4)}
+    # --- portamento between legato notes ---------------------------------------
+    glide_times = []
+    for k in range(1, len(notes)):
+        a, b = notes[k - 1], notes[k]
+        if b.start - (a.start + a.duration) > 0.06:
+            continue
+        tt, rel, _ = tracks[k]
+        interval = a.pitch - b.pitch
+        if abs(interval) < 1 or len(rel) < 4:
+            continue
+        r0 = np.median(rel[tt < 0.012]) if np.any(tt < 0.012) else rel[0]
+        if abs(r0) > 0.15 * abs(interval) and np.sign(r0) == np.sign(interval):
+            close = np.nonzero(np.abs(rel) < 0.3)[0]
+            if len(close):
+                glide_times.append(float(tt[close[0]]) * 1.5)
+    glide = float(np.median(glide_times)) if len(glide_times) >= max(1, 0.5 * max(1, len(notes) - 1)) else 0.0
+    return pitch_lfo, pitch_env, round(glide, 4)
+
+
+def pitch_model(t, pitch_lfo, pitch_env, glide, prev_interval=0.0, bpm=140.0, parts=False):
+    """Pitch offset (semitones) the patch itself produces at note-relative
+    time ``t``: what gets removed from the MIDI bends. With ``parts`` returns
+    (periodic part, transient part)."""
+    t = np.asarray(t, dtype=float)
+    trans = np.zeros_like(t)
+    per = np.zeros_like(t)
+    if pitch_env:
+        trans += pitch_env["semis"] * np.exp(-4.6 * t / max(pitch_env["decay_s"], 1e-3))
+    if glide and prev_interval:
+        trans += prev_interval * np.exp(-t / (glide / 3.0))
+    if pitch_lfo:
+        pts = pitch_lfo["shape_points"]
+        xs = [p[0] for p in pts] + [1.0]
+        ys = [p[1] for p in pts] + [pts[0][1]]
+        ph = np.mod(t / pitch_lfo["period_s"], 1.0)
+        per += (np.interp(ph, xs, ys) - 0.5) * pitch_lfo["semis"]
+    return (per, trans) if parts else per + trans
+
+
+def strip_modelled_pitch(notes, pitch_lfo, pitch_env, glide, threshold: float = 0.15, window_s: float | None = None) -> None:
+    """Remove the pitch movement the patch now produces from each note's MIDI
+    bend so pitch is not applied twice.
+
+    The analysis window smears fast sweeps, so a modelled transient (pitch
+    envelope, glide) is not subtracted point by point: the start of the note
+    (until the sweep has settled, smeared by the window) belongs to it, and
+    only the rest is compared with the periodic (LFO) part. A bend is
+    dropped when 90 % of what is left is within ``threshold`` semitones."""
+    win = window_s if window_s is not None else N_FFT / 22050.0
+    for k, n in enumerate(notes):
+        if not n.bend:
+            continue
+        legato = k > 0 and n.start - (notes[k - 1].start + notes[k - 1].duration) <= 0.06
+        tt = np.array([b[0] for b in n.bend], dtype=float)
+        v = np.array([b[1] for b in n.bend], dtype=float)
+        per, _ = pitch_model(tt, pitch_lfo, None, 0.0, parts=True)
+        res = v - per
+        settle = 0.02
+        if pitch_env:
+            settle = max(settle, 2 * pitch_env["decay_s"] / 4.6 * 2.3 + win / 2)
+        if glide and legato:
+            settle = max(settle, 2 * glide + win / 2)
+        if settle > 0.02:
+            settle = max(settle, 0.25)
+        body = res[tt >= settle]
+        if settle > 0.02 and len(body) >= 3 and abs(float(np.median(body))) > 0.05:
+            # the note pitch was read while the sweep was settling: re-centre it
+            off = float(np.median(body))
+            n.pitch = round(float(n.pitch + off), 3)
+            res = res - off
+            body = body - off
+        if len(body) == 0 or np.percentile(np.abs(body), 90) < threshold:
+            n.bend = None
+        else:
+            n.bend = [[round(float(a), 4), round(float(b), 3)] for a, b in zip(tt, np.where(tt >= settle, res, 0.0))]
 
 
 def analyze(y: np.ndarray, sr: int, bpm: float | None = None) -> Analysis:
@@ -583,6 +771,13 @@ def analyze(y: np.ndarray, sr: int, bpm: float | None = None) -> Analysis:
             cands.append(r)
     if cands:
         lfo = max(cands, key=lambda r: r["strength"] * (1 + r["depth"]))
+    pitch_lfo, pitch_env, glide, notes_raw = None, None, 0.0, None
+    if not percussive_hint:
+        pitch_lfo, pitch_env, glide = _pitch_movement(notes, times, f0, bpm)
+        if pitch_lfo or pitch_env or glide:
+            import copy as _copy
+            notes_raw = _copy.deepcopy(notes)
+            strip_modelled_pitch(notes, pitch_lfo, pitch_env, glide, window_s=N_FFT / sr)
     beat = 60.0 / bpm
     grid = []
     for nt in notes:
@@ -597,4 +792,5 @@ def analyze(y: np.ndarray, sr: int, bpm: float | None = None) -> Analysis:
                     noise_ratio=noise_ratio, noise_tilt=noise_tilt,
                     unison_hint=_unison_hint(Sx, f0, sr), env=env, percussive=percussive,
                     lfo=lfo, grid={"notes": grid, "bpm": bpm},
+                    pitch_lfo=pitch_lfo, pitch_env=pitch_env, glide=glide, notes_raw=notes_raw,
                     spectrum_db=ltas - ltas.max(), spectrum_hz=freqs)

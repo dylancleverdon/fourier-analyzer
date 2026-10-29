@@ -164,7 +164,60 @@ function renderPastResults() {
 }
 
 // ------------------------------------------------------------------ audio + playhead
-const player = $("#player");
+// Web Audio player with the <audio> element's interface. The AudioContext stays
+// running, so playback starts on the first sample (an <audio> element lets the
+// output device spin up first and drops the start of the clip), and the
+// playhead follows the audio clock including the output latency.
+class BufferPlayer {
+  constructor() { this.ctx = null; this.buf = null; this.node = null; this.offset = 0; this.t0 = 0; this.paused = true; this.ls = {}; this.token = 0; this.want = 0; }
+  addEventListener(ev, fn, opts) { (this.ls[ev] = this.ls[ev] || []).push({ fn, once: !!(opts && opts.once) }); }
+  emit(ev) { const l = this.ls[ev] || []; this.ls[ev] = l.filter((x) => !x.once); l.forEach((x) => x.fn()); }
+  audioCtx() { if (!this.ctx) this.ctx = new (window.AudioContext || window.webkitAudioContext)(); return this.ctx; }
+  get duration() { return this.buf ? this.buf.duration : NaN; }
+  set src(url) {
+    this.stopNode(); this.paused = true; this.buf = null; this.offset = 0;
+    const tok = ++this.token;
+    fetch(url).then((r) => r.arrayBuffer()).then((ab) => this.audioCtx().decodeAudioData(ab))
+      .then((b) => { if (tok === this.token) { this.buf = b; this.emit("loadedmetadata"); } })
+      .catch((e) => console.error("audio load failed", e));
+  }
+  latency() { const c = this.ctx; return c ? (c.outputLatency || 0) + (c.baseLatency || 0) : 0; }
+  get currentTime() {
+    if (this.paused || !this.ctx) return this.offset;
+    return Math.min(this.duration, this.offset + Math.max(0, this.ctx.currentTime - this.t0 - this.latency()));
+  }
+  set currentTime(t) {
+    const playing = !this.paused;
+    this.offset = Math.max(0, Math.min(t || 0, this.buf ? this.buf.duration : t || 0));
+    if (playing) this.startNode();
+    this.emit("seeked");
+  }
+  stopNode() { const n = this.node; this.node = null; if (n) { try { n.stop(); } catch (e) { /* not started */ } n.disconnect(); } }
+  startNode() {
+    this.stopNode();
+    const c = this.ctx, n = c.createBufferSource();
+    n.buffer = this.buf; n.connect(c.destination);
+    n.onended = () => { if (this.node === n) { this.node = null; this.paused = true; this.offset = this.buf.duration; this.emit("pause"); this.emit("ended"); } };
+    this.t0 = c.currentTime + 0.005;
+    n.start(this.t0, Math.min(this.offset, this.buf.duration));
+    this.node = n;
+  }
+  play() {
+    if (!this.buf) return Promise.resolve();
+    const want = ++this.want, c = this.audioCtx();
+    return c.resume().then(() => {
+      if (want !== this.want || !this.paused) return;
+      if (this.offset >= this.buf.duration - 0.001) this.offset = 0;
+      this.paused = false; this.startNode(); this.emit("play");
+    });
+  }
+  pause() {
+    this.want++;
+    if (this.paused) return;
+    this.offset = this.currentTime; this.stopNode(); this.paused = true; this.emit("pause");
+  }
+}
+const player = new BufferPlayer();
 state.playStem = null;   // stem loaded in the player
 state.stopAt = null;     // end of selection playback
 function rowButton(name) {
@@ -552,10 +605,17 @@ function drawRoll(a, sc) {
 
 // ------------------------------------------------------------------ reconstruction
 $("#target").oninput = () => ($("#targetVal").textContent = $("#target").value);
+$("#budget").onchange = () => ($("#budgetCustomWrap").hidden = $("#budget").value !== "custom");
+function budgetSeconds() {
+  const v = $("#budget").value;
+  if (v === "custom") return Math.max(1, parseFloat($("#budgetCustom").value) || 60) * 60;
+  return parseFloat(v);
+}
 $("#runRecon").onclick = async () => {
   const body = {
     stem: state.stem, ...selRange(), bpm: parseFloat($("#bpm").value) || null,
-    target: parseFloat($("#target").value), time_budget: parseFloat($("#budget").value),
+    target: parseFloat($("#target").value), time_budget: budgetSeconds(),
+    keep_going: $("#keepGoing").checked, sidechain_in_preset: $("#scInPreset").checked,
     verify_serum: $("#verifySerum").checked,
   };
   if (!body.start && state.duration > 12 && !confirm("No selection: the whole stem will be used (only the first 6 s drive the search). Continue?")) return;
@@ -614,10 +674,21 @@ function showJob(j) {
   $("#jobBox").hidden = false;
   const d = j.detail || {};
   const kind = { reconstruct: "Reconstructing patch", separate: "Separating stems", split: "Splitting layers", calibrate: "Calibrating" }[j.kind] || j.kind || "";
-  $("#jobStage").textContent = `${kind}${j.status === "done" ? " · done" : ""}`;
+  const stopping = j.cancel_requested && j.status === "running";
+  $("#jobStage").textContent = `${kind}${j.status === "done" ? " · done" : j.status === "cancelled" ? " · cancelled" : stopping ? " · stopping…" : ""}`;
   let timing = `running ${clock(j.elapsed)}`;
-  if (j.status === "done") timing = `finished in ${clock(j.elapsed)}`;
+  if (j.status === "done" || j.status === "cancelled") timing = `finished in ${clock(j.elapsed)}`;
+  else if (d.budget && d.elapsed != null && d.budget > 7 * 86400) timing += ` · search ${clock(d.elapsed)} (until you stop it)`;
   else if (d.budget && d.elapsed != null) timing += ` · search ${clock(d.elapsed)} of ${clock(d.budget)} (~${clock(d.budget - d.elapsed)} left)`;
+  const cb = $("#jobCancel");
+  cb.hidden = !(j.status === "queued" || j.status === "running");
+  cb.disabled = !!j.cancel_requested;
+  cb.textContent = j.kind === "reconstruct" ? (stopping ? "Stopping…" : "Stop (keep best)") : (stopping ? "Cancelling…" : "Cancel");
+  cb.onclick = async () => {
+    if (j.kind !== "reconstruct" && !confirm("Cancel this job? Its progress will be lost.")) return;
+    cb.disabled = true;
+    await post(`/api/jobs/${j.id}/cancel`, {});
+  };
   $("#jobTime").textContent = timing;
   $("#jobBest").textContent = j.best != null ? `best match ${fmt(j.best, 1)}` : "";
   let now = d.stage_text || j.stage || "";
@@ -645,7 +716,7 @@ function pollJob(jid, done) {
     try {
       const j = await api(`/api/jobs/${jid}`);
       showJob(j);
-      if (j.status === "done" || j.status === "error") {
+      if (j.status === "done" || j.status === "error" || j.status === "cancelled") {
         clearInterval(state.polling[jid]);
         if (j.status === "error") { $("#jobStage").textContent = "Error: " + j.error; }
         else setTimeout(() => ($("#jobBox").hidden = true), 2500);

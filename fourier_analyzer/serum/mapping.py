@@ -35,9 +35,9 @@ SCALES = {
     # in Serum 2: 8 Hz at 0, ~425 Hz at 0.5, 22.05 kHz at 1)
     "cutoff_lo_hz": 8.176,
     "cutoff_hi_hz": 22050.0,
-    # semitones reached by a +100 % modulation of Oscillator kParamCoarsePit
-    "pitch_semis_per_100": 64.0,
-    # semitones reached by +100 % modulation of Global > Main Tuning
+    # semitones reached by a +100 % modulation of Oscillator kParamCoarsePit (knob +-48)
+    "pitch_semis_per_100": 96.0,
+    # semitones reached by +100 % modulation of Global > Main Tuning (knob +-24)
     "master_tune_semis_per_100": 48.0,
     "lfo_rate_is_hz": True,
     "tablepos_lo": 1.0,
@@ -1399,10 +1399,8 @@ def _write_mod_matrix(st, patch, sc, fx_paths, legacy):
                 add(m.source, aux, "Oscillator", i, "kParamVolume", a * 100, m)
         elif d == "voiceamp":
             add(m.source, aux, "Global", 0, "kParamVoiceAmp", a * 100, m)
-        elif d == "pitch":
-            semis = a * 48.0
-            for i in active + ([4] if patch.sub.enabled else []):
-                add(m.source, aux, "Oscillator", i, "kParamCoarsePit", semis / sc["pitch_semis_per_100"] * 100, m)
+        elif d == "pitch":                 # LFO / envelope -> Global > Main Tuning (moves every oscillator)
+            add(m.source, aux, "Global", 0, "kParamMasterTuning", a * 48.0 / sc["master_tune_semis_per_100"] * 100, m)
         elif d == "noise.level":
             add(m.source, aux, "Oscillator", 3, "kParamVolume", a * 100, m)
         elif d == "sub.level":
@@ -1824,10 +1822,6 @@ def state_to_patch(st: dict, bank: TableBank | None = None, bpm: float = 140.0, 
             dest = f"osc{mid + 1}." + {"kParamTablePos": "pos", "kParamWarp": "warp", "kParamWarp2": "warp2"}[pn]
         elif t == "Oscillator" and mid < 3 and pn in ("kParamVolume", "kParamPan", "kParamFine"):
             dest = f"osc{mid + 1}." + {"kParamVolume": "level", "kParamPan": "pan", "kParamFine": "fine"}[pn]
-        elif t == "Oscillator" and mid < 5 and pn == "kParamCoarsePit" and mid != 3:
-            dest, amt = "pitch", amt * sc["pitch_semis_per_100"] / 48
-            if any(x.dest == "pitch" and x.source == src and x.aux == aux for x in mods):
-                continue        # one pitch mod is written per oscillator; keep a single entry
         elif t == "Oscillator" and mid == 3 and pn == "kParamVolume":
             dest = "noise.level"
         elif t == "Oscillator" and mid == 4 and pn == "kParamVolume":

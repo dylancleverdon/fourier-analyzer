@@ -177,3 +177,42 @@ def logic_settings(model: dict) -> str:
             f"Attack {model['attack_ms']:.0f} ms, Release {model['hold_ms'] + model['release_ms']:.0f} ms, "
             f"ratio 8:1 or higher, lower Threshold until gain reduction peaks near "
             f"{model['depth_db']:.1f} dB on each kick.")
+
+
+def add_to_patch(patch, model: dict, bpm: float, enabled: bool = False) -> str | None:
+    """Put the measured ducking into the preset as a tempo-synced LFO on
+    Serum's Voice Amp (the classic "LFO sidechain"). The mod slot is written
+    bypassed unless ``enabled``: Serum users can switch it on instead of a
+    sidechain compressor in the DAW, without ducking twice. Returns a short
+    description, or None when there is no regular kick pattern."""
+    from ..synth.patch import LFO, Mod, SYNC_DIVISIONS, sync_to_hz
+    if not model or not model.get("detected") or len(model.get("kicks", [])) < 3:
+        return None
+    kicks = np.asarray(model["kicks"], dtype=float)
+    period = float(np.median(np.diff(kicks)))
+    best, err = None, 1e9
+    for d in SYNC_DIVISIONS:
+        p = 1.0 / sync_to_hz(d, bpm)
+        e = abs(p - period) / period
+        if e < err:
+            best, err = d, e
+    if best is None or err > 0.08:
+        return None                    # kicks are not on a regular grid: leave it to the DAW
+    period = 1.0 / sync_to_hz(best, bpm)
+    xs = np.linspace(0, 1, 25)
+    g = 10 ** (duck_shape(xs * period, model["depth_db"], model["attack_ms"] / 1000,
+                          model["hold_ms"] / 1000, model["release_ms"] / 1000) / 20)
+    duck = 1 - g
+    depth = float(duck.max())
+    if depth <= 0.01:
+        return None
+    pts = [[float(x), float(v / depth), 0.5] for x, v in zip(xs, duck)]
+    used = {m.source for m in patch.mods} | {m.aux for m in patch.mods if m.aux}
+    slot = next((k for k in range(len(patch.lfos) - 1, -1, -1) if f"lfo{k + 1}" not in used), None)
+    if slot is None:
+        return None
+    phase = float((-kicks[0] / period) % 1.0)
+    patch.lfos[slot] = LFO(shape="custom", sync=best, mode="free", anchored=True, points=pts, phase=phase)
+    patch.mods.append(Mod(f"lfo{slot + 1}", "voiceamp", -0.5 * depth, bypass=not enabled))
+    state = "on" if enabled else "bypassed (enable the mod slot in Serum's MATRIX)"
+    return f"sidechain as LFO{slot + 1} {best} -> Voice Amp, -{model['depth_db']:.1f} dB, {state}"

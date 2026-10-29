@@ -29,7 +29,7 @@ def _wait(c, jid, timeout=180):
     t0 = time.time()
     while time.time() - t0 < timeout:
         j = c.get(f"/api/jobs/{jid}").json()
-        if j["status"] in ("done", "error"):
+        if j["status"] in ("done", "error", "cancelled"):
             return j
         time.sleep(0.3)
     raise AssertionError("job timed out")
@@ -68,3 +68,19 @@ def test_full_flow():
     assert "sidechain" in res and res["patch"]["oscs"][0]["table"].startswith("custom:")
     f = c.get(f"/api/projects/{pid}/results/{res['id']}/file/notes.mid")
     assert f.status_code == 200
+
+
+def test_cancel_job():
+    from fourier_analyzer import project
+
+    def slow(job):
+        for _ in range(200):
+            job.check()
+            time.sleep(0.02)
+        return {}
+    c = TestClient(app)
+    j = project.JOBS.submit("separate", slow)
+    time.sleep(0.2)
+    assert c.post(f"/api/jobs/{j.id}/cancel").json()["cancel_requested"]
+    assert _wait(c, j.id, timeout=10)["status"] == "cancelled"
+    assert c.post("/api/jobs/nope/cancel").status_code == 404

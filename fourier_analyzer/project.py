@@ -23,12 +23,17 @@ log = logging.getLogger(__name__)
 # jobs
 
 
+class Cancelled(BaseException):
+    """Raised inside a job when the user cancels it (BaseException so fallbacks
+    that catch ``Exception`` do not swallow it)."""
+
+
 @dataclass
 class Job:
     id: str
     kind: str
     project: str | None = None
-    status: str = "queued"          # queued | running | done | error
+    status: str = "queued"          # queued | running | done | error | cancelled
     progress: float = 0.0
     stage: str = ""
     best: float | None = None
@@ -38,6 +43,16 @@ class Job:
     created: float = field(default_factory=time.time)
     detail: dict = field(default_factory=dict)   # live status (what is happening right now)
     finished: float | None = None
+    cancel_requested: bool = False
+
+    def cancel(self):
+        self.cancel_requested = True
+        self.msg("cancel requested")
+
+    def check(self):
+        """Abort the job here if the user cancelled it."""
+        if self.cancel_requested:
+            raise Cancelled()
 
     def set(self, stage: str, text: str, **extra):
         """Update the live status line without adding to the log."""
@@ -57,7 +72,8 @@ class Job:
         return {"id": self.id, "kind": self.kind, "project": self.project, "status": self.status,
                 "progress": round(self.progress, 3), "stage": self.stage, "best": self.best,
                 "elapsed": round(end - self.created, 1), "detail": d,
-                "log": self.log[-300:], "result": self.result, "error": self.error}
+                "log": self.log[-300:], "result": self.result, "error": self.error,
+                "cancel_requested": self.cancel_requested}
 
 
 def parallel_jobs() -> int:
@@ -85,11 +101,17 @@ class JobManager:
             self.jobs[job.id] = job
 
         def run():
+            if job.cancel_requested:
+                job.status, job.finished = "cancelled", time.time()
+                return
             job.status = "running"
             try:
                 job.result = fn(job)
                 job.status = "done"
                 job.progress = 1.0
+            except Cancelled:
+                job.status = "cancelled"
+                job.msg("cancelled")
             except Exception as e:
                 job.status = "error"
                 job.error = f"{type(e).__name__}: {e}"
@@ -233,6 +255,7 @@ def start_separation(pid: str, drums: bool = True, clip: tuple | None = None) ->
         job.progress = 0.05
 
         def prog(text):
+            job.check()
             job.msg(text)
             job.progress = min(0.85, job.progress + 0.1)
         for old in (d / "stems").glob("*"):          # re-separation replaces old stems
@@ -240,7 +263,14 @@ def start_separation(pid: str, drums: bool = True, clip: tuple | None = None) ->
                 shutil.rmtree(old, ignore_errors=True)
             else:
                 old.unlink(missing_ok=True)
-        stems = separate_all(d / "mix.wav", d / "stems", progress=prog, drums=drums)
+        try:
+            stems = separate_all(d / "mix.wav", d / "stems", progress=prog, drums=drums)
+            job.check()
+        except Cancelled:
+            meta["status"] = "new"            # old stems were cleared above
+            meta["stems"], meta["instruments"] = {"mix": "mix.wav"}, []
+            save_meta(pid, meta)
+            raise
         meta["separation"] = getattr(separate_all, "last_method", "ml")
         meta["stems"] = {"mix": "mix.wav", **{k: str(Path(v).relative_to(d)) for k, v in stems.items()}}
         job.set("instruments", "Labelling instruments in each stem")
@@ -265,6 +295,7 @@ def start_layer_split(pid: str, stem: str, n_layers: int, start=None, end=None) 
         job.stage = "NMF layer split"
         job.msg(f"splitting {stem} into {n_layers} layers")
         out = split_layers(src, d / "stems" / "layers", n_layers, start, end)
+        job.check()
         for k, v in out.items():
             meta["stems"][k] = str(Path(v).relative_to(d))
         meta["instruments"] = [i for i in meta["instruments"] if i["stem"] not in out]
@@ -386,8 +417,15 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict) -> Job:
                 job.detail = dict(status)
             if text:
                 job.msg(text)
-        o = Options(target_score=float(opts.get("target", 90)),
-                    time_budget=float(opts.get("time_budget", 240)))
+        budget = float(opts.get("time_budget") or 0)
+        if budget <= 0:                       # "until I stop it"
+            budget = 30 * 24 * 3600.0
+        o = Options(target_score=float(opts.get("target", 90)), time_budget=budget,
+                    keep_going=bool(opts.get("keep_going", False)),
+                    stop=lambda: job.cancel_requested)
+        if budget > 900:
+            job.msg(f"long run: {'until stopped' if budget > 7 * 24 * 3600 else f'{budget / 60:.0f} min'}; "
+                    "press Stop to finish with the best patch so far")
         opt = Optimizer(y22, OPT_SR, a, o, bank=bank, progress=prog, context_gain=gain22)
         res = opt.run()
         d = res.details
@@ -398,6 +436,10 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict) -> Job:
         checks = run_checks(res.patch, opt.y, OPT_SR, opt.notes, a.f0[: int(len(opt.y) / 256) + 1],
                             opt.renderer, opt.target, gain=opt.gain)
 
+        if sc["detected"]:
+            note = SC.add_to_patch(res.patch, sc, bpm, enabled=bool(opts.get("sidechain_in_preset", False)))
+            if note:
+                job.msg(note)
         rid = time.strftime("%H%M%S-") + uuid.uuid4().hex[:4]
         out = project_dir(pid) / "results" / rid
         out.mkdir(parents=True)

@@ -58,8 +58,10 @@ MAX_OPT_SECONDS = 6.0
 @dataclass
 class Options:
     target_score: float = 90.0         # waveform similarity (%) that ends the search early
-    time_budget: float = 240.0         # seconds
+    time_budget: float = 240.0         # seconds (long budgets add exploration rounds)
     max_oscs: int = 3
+    stop: Callable[[], bool] | None = None   # returns True when the user stops / cancels
+    keep_going: bool = False           # do not stop early at the target score (long runs)
 
 
 @dataclass
@@ -112,10 +114,33 @@ class Optimizer:
         self.stages: list = []
         self.custom_ids: dict = {}
         self.reserve = 0.0          # seconds kept back for later stages
+        self.stopped = False
+        self.stop_time = 0.0
+        self._in_final = False
+        budget = self.opts.time_budget
+        self.pass_budget = min(budget, self.FIRST_PASS)
+        self.wave_reserve = min(0.25 * budget, max(0.25 * self.pass_budget, 600.0))
+        # first pass ends where the old schedule started waveform alignment
+        self.pass_end = self.t0 + (0.75 * self.pass_budget if budget <= self.FIRST_PASS
+                                   else self.pass_budget)
 
     # ------------------------------------------------------------------
+    FIRST_PASS = 900.0                 # the standard schedule never takes longer than this
+
+    STOP_GRACE = 30.0                  # after a stop: finish with a short waveform alignment
+
     def time_left(self) -> float:
+        if not self.stopped and self.opts.stop is not None and self.opts.stop():
+            self.stopped = True
+            self.stop_time = time.time()
+            self.reserve = 0.0
+        if self.stopped:
+            return max(0.0, self.STOP_GRACE - (time.time() - self.stop_time)) if self._in_final else 0.0
         return self.opts.time_budget - (time.time() - self.t0)
+
+    def pass_left(self) -> float:
+        """Time left in the first (standard) pass."""
+        return min(self.time_left(), self.pass_end - time.time())
 
     def set_stage(self, stage: str, activity: str = ""):
         if stage != self.stage:
@@ -261,7 +286,36 @@ class Optimizer:
             if a.noise_ratio > 0.12:
                 p.noise = NoiseOsc(enabled=True, color=float(np.clip(0.5 + a.noise_tilt / 24, 0, 1)),
                                    level=float(np.clip(a.noise_ratio, 0.05, 0.8)))
+        self._pitch_and_velocity(p)
         return p
+
+    def _pitch_and_velocity(self, p: Patch) -> None:
+        """Movement the analysis attributes to the patch itself: LFO / envelope
+        -> Main Tuning, portamento, and Serum's VELO -> Amp for note dynamics.
+        These are kept through pruning (they carry what the MIDI no longer has)."""
+        a = self.analysis
+        vels = [n.velocity for n in self.notes]
+        if len(vels) > 1 and float(np.std(vels)) > 0.04:
+            # analysis velocity = sqrt(level ratio); a squared velocity curve makes
+            # Serum's voice gain follow the measured note levels
+            p.voice_amp = 0.0
+            p.velo_curve = [[0.0, 0.0, 0.6667], [1.0, 1.0, 0.5]]
+            p.mods.append(Mod("velocity", "voiceamp", 0.5))
+        if getattr(a, "pitch_lfo", None):
+            lf = a.pitch_lfo
+            k = 7
+            pts = lf["shape_points"] + [[1.0, lf["shape_points"][0][1]]]
+            p.lfos[k] = LFO(shape="custom", sync=lf["sync"], rate_hz=lf["rate_hz"], mode="trig", points=pts)
+            p.mods.append(Mod(f"lfo{k + 1}", "pitch", float(lf["semis"]) / 48.0, bipolar=True))
+        if getattr(a, "pitch_env", None) and not a.percussive:
+            pe = a.pitch_env
+            p.envs[2] = Env(attack=0.0005, decay=float(np.clip(pe["decay_s"], 0.005, 8)), sustain=0.0, release=0.05)
+            p.mods.append(Mod("env3", "pitch", float(pe["semis"]) / 48.0))
+        if getattr(a, "glide", 0.0):
+            p.glide = float(a.glide)
+            p.legato = True
+            p.glide_always = False
+        self.protected = {(m.source, m.dest) for m in p.mods if m.dest in ("pitch", "voiceamp")}
 
     # ------------------------------------------------------------------
     def structure_moves(self, p: Patch) -> list[tuple[str, Callable[[Patch], Patch], set]]:
@@ -509,6 +563,8 @@ class Optimizer:
                 return q
             mv(f"FX {m.get('type')}", drop_fx)
         for j, m in enumerate(p.mods):
+            if (m.source, m.dest) in getattr(self, "protected", set()):
+                continue
             mv(f"mod {m.source}->{m.dest}", lambda q, j=j: (q.mods.pop(j), q)[1])
         if p.filter.enabled and not any(m.dest.startswith("filter") for m in p.mods):
             mv("filter", lambda q: (setattr(q.filter, "enabled", False), q)[1])
@@ -526,7 +582,7 @@ class Optimizer:
         cands = self.custom_table_patches(p)
         self.set_stage("tables", f"{len(cands)} custom wavetable designs")
         results = []
-        per = max(30, int(min(90, self.time_left() * 0.25 / max(1, len(cands)) / 0.03)))
+        per = max(30, int(min(90, self.pass_left() * 0.33 / max(1, len(cands)) / 0.03)))
         for label, q in cands:
             self.activity = f"tuning the '{label}' wavetable"
             q, s = self.tune(q, per, focus={"osc", "env", "mod"})
@@ -540,8 +596,8 @@ class Optimizer:
 
         # --- 3. greedy structure search -------------------------------------
         added = []
-        while self.time_left() > opts.time_budget * 0.3 and score < 99.0:
-            if added and self.ref.waveform(self.render(p)) >= opts.target_score:
+        while self.pass_left() > (self.pass_end - self.t0) * 0.07 and score < 99.0:
+            if added and not opts.keep_going and self.ref.waveform(self.render(p)) >= opts.target_score:
                 break
             moves = self.structure_moves(p)
             self.set_stage("structure", f"screening {len(moves)} possible additions")
@@ -549,7 +605,7 @@ class Optimizer:
             # however many there are, then a short tune of the top dozen
             quick = []
             for name, fn, focus in moves:
-                if self.time_left() < opts.time_budget * 0.3:
+                if self.pass_left() < (self.pass_end - self.t0) * 0.06:
                     break
                 self.activity = f"screening: {name}"
                 q = fn(p.copy())
@@ -557,7 +613,7 @@ class Optimizer:
             quick.sort(key=lambda r: -r[0])
             screened = []
             for _, name, q, focus in quick[:12]:
-                if self.time_left() < opts.time_budget * 0.3:
+                if self.pass_left() < (self.pass_end - self.t0) * 0.06:
                     break
                 self.activity = f"short tune: {name}"
                 q, s = self.tune(q, 12, focus=focus, sigma=0.2)
@@ -565,7 +621,7 @@ class Optimizer:
             screened.sort(key=lambda r: -r[0])
             best = (score, None, None)
             for s0, name, q, focus in screened[:4]:
-                if self.time_left() < opts.time_budget * 0.3:
+                if self.pass_left() < (self.pass_end - self.t0) * 0.06:
                     break
                 self.activity = f"testing best candidate: {name}"
                 q, s = self.tune(q, 48, focus=focus | {"filter", "osc", "env"}, sigma=0.1)
@@ -582,7 +638,7 @@ class Optimizer:
         self.set_stage("prune", "removing components that do not help")
         removed = []
         changed = True
-        while changed and self.time_left() > opts.time_budget * 0.15:
+        while changed and self.pass_left() > (self.pass_end - self.t0) * 0.03:
             changed = False
             for name, fn in self.prune_moves(p):
                 q = fn(p.copy())
@@ -596,15 +652,19 @@ class Optimizer:
         self.stages.append({"stage": "pruning", "score": round(score, 2), "steps": removed})
 
         # --- 5. fine-tune ----------------------------------------------------
-        budget = int(max(40, self.time_left() * 0.6 / 0.03))
+        budget = int(max(40, self.pass_left() * 0.9 / 0.03))
         self.set_stage("fine-tune", f"all {len(P.continuous_params(p))} parameters together")
-        self.reserve = 0.25 * opts.time_budget      # keep time for waveform alignment
+        self.reserve = max(0.0, self.time_left() - self.pass_left())   # the rest belongs to later stages
         p, score = self.tune(p, budget, sigma=0.08)
         self.report("fine-tune", f"{score:.1f}")
         self.stages.append({"stage": "fine-tune", "score": round(score, 2)})
 
+        # --- 5b. exploration rounds (long searches) ----------------------------
+        p, score = self._explore(p, score)
+
         # --- 6. waveform alignment --------------------------------------------
         self.reserve = 0.0
+        self._in_final = True
         if self.time_left() > 2:
             self.set_stage("waveform", "start phase, fine tune and attack against the literal waveform")
             ps = []
@@ -621,10 +681,65 @@ class Optimizer:
             self.stages.append({"stage": "waveform alignment", "score": round(after, 2)})
 
         self.set_stage("final", "computing similarity metrics")
+        if self.stopped:
+            self.stages.append({"stage": "stopped", "score": round(score, 2),
+                                "note": "stopped by the user; best patch so far"})
         metrics = self.ref.all(self.render(p))
         total = metrics["waveform_similarity"]
         return Result(patch=p, score=total, details=metrics, notes=self.analysis.notes, bank=self.bank,
                       history=self.history, used_custom=True, stages=self.stages)
+
+    def _explore(self, p: Patch, score: float) -> tuple[Patch, float]:
+        """Extra time beyond the standard schedule: repeated rounds of structure
+        search (every candidate gets a short tune), pruning and CMA-ES restarts
+        from the best patch. Only improvements are kept."""
+        opts = self.opts
+        self.reserve = self.wave_reserve
+        rounds = []
+        r = 0
+        while self.time_left() > self.wave_reserve + 20 and score < 99.5:
+            if not opts.keep_going and self.ref.waveform(self.render(p)) >= opts.target_score:
+                break
+            r += 1
+            start_score = score
+            self.set_stage("explore", f"round {r}: more structure ideas and restarts")
+            moves = self.structure_moves(p)
+            screened = []
+            for name, fn, focus in moves:
+                if self.time_left() <= self.wave_reserve + 20:
+                    break
+                self.activity = f"round {r}: trying {name}"
+                q, s = self.tune(fn(p.copy()), 24, focus=focus, sigma=0.2)
+                screened.append((s, name, q, focus))
+            screened.sort(key=lambda t: -t[0])
+            for s0, name, q, focus in screened[:6]:
+                if self.time_left() <= self.wave_reserve + 20:
+                    break
+                self.activity = f"round {r}: tuning {name}"
+                q, s = self.tune(q, 120, focus=focus | {"filter", "osc", "env", "mod"}, sigma=0.1)
+                if s > score + 0.15:
+                    p, score = q, s
+                    self.report("explore", f"round {r}: kept '{name}' -> {score:.1f}")
+            for name, fn in self.prune_moves(p):
+                q = fn(p.copy())
+                s = self.evaluate(q)
+                if s >= score - 0.1:
+                    p, score = q, s
+            # restart the full optimisation from the best patch (wider, then narrower)
+            for sigma in (0.15, 0.05):
+                if self.time_left() <= self.wave_reserve + 20:
+                    break
+                self.activity = f"round {r}: all parameters, step {sigma}"
+                evals = int(min(self.time_left() - self.wave_reserve, 600) * 0.5 / 0.03)
+                q, s = self.tune(p, max(40, evals), sigma=sigma)
+                if s > score:
+                    p, score = q, s
+            rounds.append({"round": r, "score": round(score, 2), "gain": round(score - start_score, 2)})
+            self.report("explore", f"round {r} done: {score:.1f}")
+        if rounds:
+            self.stages.append({"stage": "exploration", "score": round(score, 2), "rounds": rounds})
+        self.reserve = 0.0
+        return p, score
 
     def refine_note_timing(self, p: Patch, span: float = 0.006, steps: int = 13) -> None:
         """Shift each note start (end fixed) within +-span to maximise the

@@ -359,7 +359,9 @@ class RegionIn(BaseModel):
     end: float | None = None
     bpm: float | None = None
     target: float = 90.0
-    time_budget: float = 240.0
+    time_budget: float = 240.0          # seconds; 0 = until the user presses Stop
+    keep_going: bool = False            # keep improving after reaching the target
+    sidechain_in_preset: bool = False   # write the detected ducking into the preset (LFO -> Voice Amp)
     verify_serum: bool = True
 
 
@@ -393,6 +395,18 @@ def job(jid: str):
     if not j:
         raise HTTPException(404, "no such job")
     return j.to_dict()
+
+
+@app.post("/api/jobs/{jid}/cancel")
+def cancel_job(jid: str):
+    """Cancel a job. A reconstruction stops and keeps its best patch so far;
+    separation and layer splits abort."""
+    j = project.JOBS.get(jid)
+    if not j:
+        raise HTTPException(404, "no such job")
+    if j.status in ("queued", "running"):
+        j.cancel()
+    return {"status": j.status, "cancel_requested": j.cancel_requested}
 
 
 @app.get("/api/projects/{pid}/results/{rid}")

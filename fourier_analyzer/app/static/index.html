@@ -51,7 +51,7 @@
         <div class="bpm">BPM <input id="bpm" type="number" step="0.01" min="40" max="300"><span id="bpmAlts" class="bpm-alts"></span></div>
       </div>
       <div id="jobBox" class="job" hidden>
-        <div class="job-row"><span><b id="jobStage"></b> <span id="jobTime" class="muted mono"></span></span><span id="jobBest"></span></div>
+        <div class="job-row"><span><b id="jobStage"></b> <span id="jobTime" class="muted mono"></span></span><span><span id="jobBest"></span> <button id="jobCancel" class="small" hidden>Cancel</button></span></div>
         <div id="jobNow" class="job-now"></div>
         <div class="bar"><div id="jobBar"></div></div>
         <pre id="jobLog"></pre>
@@ -139,9 +139,13 @@
             </div>
             <div class="opt">
               <label>Search time</label>
-              <select id="budget"><option value="90">1.5 min</option><option value="240" selected>4 min</option><option value="480">8 min</option><option value="900">15 min</option></select>
+              <select id="budget"><option value="90">1.5 min</option><option value="240" selected>4 min</option><option value="480">8 min</option><option value="900">15 min</option><option value="1800">30 min</option><option value="3600">1 hour</option><option value="7200">2 hours</option><option value="14400">4 hours</option><option value="28800">8 hours</option><option value="custom">Custom…</option><option value="0">Until I stop it</option></select>
+              <span id="budgetCustomWrap" hidden><input id="budgetCustom" type="number" min="1" step="1" value="60" style="width:6em"> min</span>
+              <div class="muted small">Runs over 15 min keep experimenting after the first full pass (new structures, filters, FX, restarts) and keep the best patch. Press Stop at any time to finish with the best one so far.</div>
             </div>
             <div class="opt checks">
+              <label class="check"><input id="keepGoing" type="checkbox"> keep improving after reaching the target</label>
+              <label class="check"><input id="scInPreset" type="checkbox"> put detected sidechain ducking into the preset (LFO → Voice Amp)</label>
               <label class="check"><input id="verifySerum" type="checkbox" checked> verify in real Serum 2</label>
             </div>
             <button id="runRecon" class="primary">Reconstruct</button>
@@ -211,7 +215,6 @@
   </form>
 </dialog>
 
-<audio id="player"></audio>
 <script src="/static/app.js"></script>
 </body>
 </html>
