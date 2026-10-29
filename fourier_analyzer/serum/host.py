@@ -148,7 +148,10 @@ def _vc2_wrap(xml: str) -> bytes:
     return b"VC2!" + struct.pack("<I", len(b)) + b + b"\0"
 
 
-def _swap_vc2(blob: bytes, preset: bytes) -> bytes | None:
+_CTRL_RE = re.compile(r"<IEditController>[^<]*</IEditController>|<IEditController\s*/>")
+
+
+def _swap_vc2(blob: bytes, preset: bytes, drop_controller: bool = False) -> bytes | None:
     """Swap the preset inside the first JUCE-base64 blob of a VC2! XML state
     that contains Serum's data."""
     xml = _vc2_xml(blob)
@@ -170,6 +173,10 @@ def _swap_vc2(blob: bytes, preset: bytes) -> bytes | None:
         done = True
         return ">" + juce_b64_encode(new_inner) + "<"
     new_xml = _JUCE_TEXT.sub(repl, xml)
+    if done and drop_controller:
+        # without a controller blob the host only applies the component state,
+        # so an old controller state cannot reset the preset we just loaded
+        new_xml = _CTRL_RE.sub("", new_xml)
     return _vc2_wrap(new_xml) if done else None
 
 
@@ -179,7 +186,19 @@ def describe_blob(blob: bytes, depth: int = 0) -> str:
     if blob.find(MAGIC) >= 0:
         parts.append(f"XferJson@{blob.find(MAGIC)}")
     for k, used, raw in _zstd_frames(blob):
-        parts.append(f"zstd@{k} {used}->{len(raw)}B head {raw[:8].hex()}")
+        info = f"zstd@{k} {used}->{len(raw)}B head {raw[:8].hex()}"
+        try:
+            import cbor2
+            obj = cbor2.loads(raw)
+            if isinstance(obj, dict):
+                keys = list(obj)
+                info += f" cbor dict {len(keys)} keys e.g. {keys[:6]}"
+                for key in ("presetName", "productVersion", "version"):
+                    if key in obj:
+                        info += f" {key}={obj[key]!r}"
+        except Exception:
+            pass
+        parts.append(info)
     if blob[:6] == b"bplist" or blob[:5] == b"<?xml":
         parts.append("plist")
     xml = _vc2_xml(blob) if depth < 2 else None
@@ -300,22 +319,68 @@ class SerumHost:
         self.plugin, self.description = _open_plugin(paths)
         self.base_state = bytes(self.plugin.raw_state)
 
+    def _pump(self, seconds: float = 0.05) -> None:
+        """Let the plugin run (some plugins load presets asynchronously)."""
+        try:
+            self.plugin([], duration=seconds, sample_rate=self.sr, num_channels=2, buffer_size=512, reset=False)
+        except Exception:
+            pass
+
     def load_preset(self, preset: bytes) -> None:
-        new = _swap_in_state(self.base_state, preset)
-        if new is None:
-            dump = config.app_dir() / "serum_state_dump.bin"
+        import time
+        attempts = []
+        for drop in (True, False):
+            if self.base_state[:4] == b"VC2!":
+                new = _swap_vc2(self.base_state, preset, drop_controller=drop)
+            elif drop:
+                new = _swap_in_state(self.base_state, preset)
+            else:
+                continue
+            if new is None:
+                break
             try:
-                dump.write_bytes(self.base_state)
-            except OSError:
-                pass
+                self.plugin.raw_state = new
+            except Exception as e:
+                attempts.append((drop, new, None, f"setting state raised {type(e).__name__}: {e}"))
+                continue
+            # confirm Serum took it: its state must stop being the init patch.
+            # Serum 2 may load in the background, so give it up to ~3 s.
+            after = b""
+            for _ in range(30):
+                self._pump()
+                after = bytes(self.plugin.raw_state)
+                if after != self.base_state:
+                    return
+                time.sleep(0.1)
+            attempts.append((drop, new, after, "state unchanged after 3 s"))
+        diag = self._write_diagnostics(preset, attempts)
+        if not attempts:
             raise SerumHostError("could not find Serum's preset data in the plugin state ("
-                                 + describe_blob(self.base_state) + f"). Saved to {dump}")
-        self.plugin.raw_state = new
-        # confirm Serum actually took the preset: its state should now hold
-        # our filter settings / table data rather than the init patch
-        after = bytes(self.plugin.raw_state)
-        if after == self.base_state:
-            raise SerumHostError("Serum ignored the injected state (it still reports the init patch)")
+                                 + describe_blob(self.base_state) + f"). Details: {diag}")
+        raise SerumHostError("Serum ignored the injected preset (it still reports the init patch). "
+                             f"Please send {diag}")
+
+    def _write_diagnostics(self, preset: bytes, attempts) -> Path:
+        path = config.app_dir() / "serum_diagnostics.txt"
+        lines = [f"plugin: {getattr(self, 'description', '?')}",
+                 f"base state: {describe_blob(self.base_state)}"]
+        for drop, new, after, why in attempts:
+            lines.append(f"--- attempt drop_controller={drop}: {why}")
+            lines.append(f"injected: {describe_blob(new)}")
+            if after is not None:
+                lines.append(f"after:    {describe_blob(after)}")
+        try:
+            names = list(self.plugin.parameters.keys())
+            lines.append(f"--- {len(names)} automatable parameters:")
+            lines += names[:3000]
+        except Exception as e:
+            lines.append(f"parameters unavailable: {e}")
+        try:
+            path.write_text("\n".join(lines))
+            (config.app_dir() / "serum_state_dump.bin").write_bytes(self.base_state)
+        except OSError:
+            pass
+        return path
 
     def render(self, notes, duration: float) -> np.ndarray:
         import mido

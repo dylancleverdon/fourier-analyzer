@@ -99,3 +99,43 @@ def test_swaps_inside_juce_vc2_xml_state():
     st = cbor2.loads(zstandard.ZstdDecompressor().decompressobj().decompress(inner[k:]))
     assert st["VoiceFilter0"]["plainParams"]["kParamEnable"] == 1.0
     assert host.juce_b64_encode(b"ctrl") in new_xml          # controller state untouched
+
+
+def test_controller_dropped_and_ignored_state_reports_diagnostics(monkeypatch, tmp_path):
+    import struct
+
+    import zstandard
+
+    from fourier_analyzer import config
+    from fourier_analyzer.serum.mapping import load_skeleton
+    from fourier_analyzer.serum.preset import encode_state, write_preset_bytes
+    init = encode_state(load_skeleton())
+    comp = struct.pack("<II", len(init), 2) + zstandard.ZstdCompressor().compress(init)
+    xml = ("<VST3PluginState><IComponent>" + host.juce_b64_encode(comp) + "</IComponent><IEditController>"
+           + host.juce_b64_encode(b"ctrl") + "</IEditController></VST3PluginState>")
+    base = b"VC2!" + struct.pack("<I", len(xml)) + xml.encode() + b"\0"
+    preset = write_preset_bytes(load_skeleton(), "t")
+    assert b"IEditController" not in host._swap_vc2(base, preset, drop_controller=True)
+
+    class Stubborn:                      # a plugin that never changes its state
+        @property
+        def raw_state(self):
+            return base
+
+        @raw_state.setter
+        def raw_state(self, value):
+            pass
+        parameters = {"A Level": 0, "Fil Cutoff": 0}
+
+        def __call__(self, *a, **k):
+            return None
+    h = host.SerumHost.__new__(host.SerumHost)
+    h.plugin, h.base_state, h.sr, h.description = Stubborn(), base, 44100, "stub"
+    monkeypatch.setattr(config, "app_dir", lambda: tmp_path)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    import pytest
+    with pytest.raises(host.SerumHostError) as e:
+        h.load_preset(preset)
+    assert "serum_diagnostics.txt" in str(e.value)
+    text = (tmp_path / "serum_diagnostics.txt").read_text()
+    assert "Fil Cutoff" in text and "drop_controller=True" in text
