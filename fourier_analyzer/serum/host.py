@@ -41,10 +41,88 @@ def _preset_len(blob: bytes, start: int) -> int:
     return (len(blob) - unused) - start
 
 
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+
+
+def _zstd_frames(blob: bytes):
+    """(offset, compressed_len, decompressed bytes) of every zstd frame."""
+    import zstandard
+    pos = 0
+    while True:
+        k = blob.find(ZSTD_MAGIC, pos)
+        if k < 0:
+            return
+        try:
+            d = zstandard.ZstdDecompressor().decompressobj()
+            out = d.decompress(blob[k:])
+            used = len(blob) - k - len(d.unused_data)
+            yield k, used, out
+        except Exception:
+            pass
+        pos = k + 4
+
+
+def _fix_lengths(new: bytes, k: int, old_vals: dict, new_vals: dict) -> bytes:
+    """Rewrite little/big-endian u32/u64 length fields in the 16 bytes before
+    offset k whose value equals one of the old lengths."""
+    b = bytearray(new)
+    for fmt, size in (("<I", 4), ("<Q", 8), (">I", 4)):
+        for off in range(max(0, k - 16), k - size + 1):
+            (v,) = struct.unpack_from(fmt, b, off)
+            for key, ov in old_vals.items():
+                if v == ov and ov != new_vals[key] and ov > 16:
+                    struct.pack_into(fmt, b, off, new_vals[key])
+    return bytes(b)
+
+
+def _swap_payload(blob: bytes, preset: bytes) -> bytes | None:
+    """Serum may store only the zstd-compressed CBOR state (no XferJson
+    header). Replace that frame with ours and fix nearby length fields."""
+    import cbor2
+    import zstandard
+    from .preset import encode_state, read_preset_bytes
+    _, state = read_preset_bytes(preset)
+    payload = encode_state(state)
+    comp = zstandard.ZstdCompressor(level=3).compress(payload)
+    for k, used, raw in _zstd_frames(blob):
+        try:
+            obj = cbor2.loads(raw)
+        except Exception:
+            continue
+        if not (isinstance(obj, dict) and any(str(x).startswith(("Oscillator", "Env", "FXRack")) for x in obj)):
+            continue
+        new = blob[:k] + comp + blob[k + used:]
+        new = _fix_lengths(new, k, {"c": used, "u": len(raw), "t": len(blob)},
+                           {"c": len(comp), "u": len(payload), "t": len(new)})
+        # a total length at the very start of the blob
+        for fmt, size in (("<I", 4), ("<Q", 8), (">I", 4)):
+            if len(blob) >= size:
+                (v,) = struct.unpack_from(fmt, blob, 0)
+                if v in (len(blob), len(blob) - size):
+                    nb = bytearray(new)
+                    struct.pack_into(fmt, nb, 0, len(new) - (len(blob) - v))
+                    new = bytes(nb)
+                    break
+        return new
+    return None
+
+
+def describe_blob(blob: bytes) -> str:
+    """Short structural summary of an unknown plugin state (for diagnostics)."""
+    parts = [f"{len(blob)} bytes", "head " + blob[:24].hex()]
+    if blob.find(MAGIC) >= 0:
+        parts.append(f"XferJson@{blob.find(MAGIC)}")
+    for k, used, raw in _zstd_frames(blob):
+        parts.append(f"zstd@{k} {used}->{len(raw)}B head {raw[:8].hex()}")
+    if blob[:6] == b"bplist" or blob[:5] == b"<?xml":
+        parts.append("plist")
+    return "; ".join(parts)
+
+
 def _swap(blob: bytes, preset: bytes) -> bytes | None:
     k = blob.find(MAGIC)
     if k < 0:
-        return None
+        return _swap_payload(blob, preset)
     old_len = _preset_len(blob, k)
     new = blob[:k] + preset + blob[k + old_len:]
     # fix a length prefix just before the container, if there is one
@@ -148,9 +226,19 @@ class SerumHost:
     def load_preset(self, preset: bytes) -> None:
         new = _swap_in_state(self.base_state, preset)
         if new is None:
-            raise SerumHostError("could not find Serum's preset container in the plugin state "
-                                 f"({len(self.base_state)} bytes); format may have changed")
+            dump = config.app_dir() / "serum_state_dump.bin"
+            try:
+                dump.write_bytes(self.base_state)
+            except OSError:
+                pass
+            raise SerumHostError("could not find Serum's preset data in the plugin state ("
+                                 + describe_blob(self.base_state) + f"). Saved to {dump}")
         self.plugin.raw_state = new
+        # confirm Serum actually took the preset: its state should now hold
+        # our filter settings / table data rather than the init patch
+        after = bytes(self.plugin.raw_state)
+        if after == self.base_state:
+            raise SerumHostError("Serum ignored the injected state (it still reports the init patch)")
 
     def render(self, notes, duration: float) -> np.ndarray:
         import mido

@@ -36,3 +36,25 @@ def test_reports_real_errors(monkeypatch):
         host._open_plugin([Path("/x/Serum2.vst3"), Path("/x/Serum2.component")])
     msg = str(e.value)
     assert "main thread" in msg and "Serum2.vst3" in msg and "Serum2.component" in msg
+
+
+def test_swaps_bare_zstd_state_and_fixes_lengths():
+    import struct
+
+    import cbor2
+    import zstandard
+
+    from fourier_analyzer.serum.mapping import load_skeleton, patch_to_state
+    from fourier_analyzer.serum.preset import encode_state, write_preset_bytes
+    from fourier_analyzer.synth.patch import Filter, Patch
+    init = encode_state(load_skeleton())
+    comp = zstandard.ZstdCompressor(level=19).compress(init)
+    blob = struct.pack("<II", len(init), 2) + comp          # Serum-like: size, version, zstd(CBOR)
+    p = Patch()
+    p.filter = Filter(enabled=True, cutoff=1234)
+    new = host._swap_in_state(blob, write_preset_bytes(patch_to_state(p), "t"))
+    assert new is not None
+    k = new.find(host.ZSTD_MAGIC)
+    raw = zstandard.ZstdDecompressor().decompressobj().decompress(new[k:])
+    assert cbor2.loads(raw)["VoiceFilter0"]["plainParams"]["kParamEnable"] == 1.0
+    assert struct.unpack_from("<I", new, 0)[0] == len(raw)
