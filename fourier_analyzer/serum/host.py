@@ -382,6 +382,12 @@ class SerumHost:
 
     def load_preset(self, preset: bytes) -> None:
         import time
+        if preset == getattr(self, "_loaded", None):
+            return
+        # wait for the state to differ from what it was before this load (not
+        # only from the init patch), so back-to-back loads in one session wait
+        # for the new preset
+        before = bytes(self.plugin.raw_state)
         attempts = []
         for mode, drop in (("merge", True), ("merge", False), ("replace", True), ("replace", False)):
             SWAP_MODE["mode"] = mode
@@ -405,7 +411,8 @@ class SerumHost:
             for _ in range(30):
                 self._pump()
                 after = bytes(self.plugin.raw_state)
-                if after != self.base_state:
+                if after != self.base_state and after != before:
+                    self._loaded = preset
                     return
                 time.sleep(0.1)
             attempts.append((f"{mode}, drop_controller={drop}", new, after, "state unchanged after 3 s"))
@@ -459,9 +466,86 @@ class SerumHost:
         return y[: int(duration * self.sr)]
 
 
+class FakeSerumHost:
+    """Stands in for Serum when ``FA_FAKE_SERUM`` is set (tests and development
+    without the plugin): presets are imported and rendered with our engine.
+    ``FA_FAKE_SERUM=cutoff:0.7`` scales filter cutoffs to mimic an engine
+    that differs from ours."""
+
+    description = "fake Serum (Fourier Analyzer engine)"
+
+    def __init__(self, sr: int = 44100, spec: str = "1"):
+        self.sr = sr
+        self.cutoff_scale = 1.0
+        for part in spec.split(","):
+            k, _, v = part.partition(":")
+            if k == "cutoff" and v:
+                self.cutoff_scale = float(v)
+        self.patch = None
+
+    def load_preset(self, preset: bytes) -> None:
+        from ..synth.wavetables import TableBank
+        from .mapping import state_to_patch
+        from .preset import read_preset_bytes
+        _, st = read_preset_bytes(preset)
+        self.bank = TableBank()
+        self.patch = state_to_patch(st, self.bank)
+        for f in (self.patch.filter, self.patch.filter2):
+            f.cutoff = float(np.clip(f.cutoff * self.cutoff_scale, 20.0, 20000.0))
+
+    def render(self, notes, duration: float) -> np.ndarray:
+        from ..synth.engine import Renderer
+        return Renderer(self.bank, self.sr).render(self.patch, notes, duration).astype(np.float32)
+
+
+def _make_host(sr: int):
+    import os
+    fake = os.environ.get("FA_FAKE_SERUM")
+    return FakeSerumHost(sr, fake) if fake else SerumHost(sr=sr)
+
+
 # ----------------------------------------------------------------------------
 # helper process: plugins are loaded on that process's main thread, and a
 # plugin crash cannot take the app down
+
+SESSION_TAG = "FA-SERUM "
+
+
+def serve_main() -> int:
+    """``serum-host serve``: keep Serum loaded and render one request per
+    stdin line ({"preset", "notes", "duration", "out"}); every answer is a
+    stdout line starting with SESSION_TAG (the plugin may print too)."""
+    import json
+    import sys
+
+    import soundfile as sf
+    from ..synth.patch import Note
+
+    def say(obj):
+        sys.stdout.write("\n" + SESSION_TAG + json.dumps(obj) + "\n")
+        sys.stdout.flush()
+    try:
+        host = _make_host(44100)
+    except Exception as e:
+        say({"ok": False, "error": f"{type(e).__name__}: {e}"})
+        return 1
+    say({"ok": True, "ready": True, "plugin": host.description})
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+            if r.get("quit"):
+                break
+            host.sr = int(r.get("sr", host.sr))
+            host.load_preset(Path(r["preset"]).read_bytes())
+            y = host.render([Note(**n) for n in r["notes"]], float(r["duration"]))
+            sf.write(r["out"], y, host.sr, subtype="FLOAT")
+            say({"ok": True})
+        except Exception as e:
+            say({"ok": False, "error": f"{type(e).__name__}: {e}"})
+    return 0
 
 
 def _parse_value(text: str):
@@ -484,10 +568,12 @@ def host_main(job_file: str) -> int:
 
     import soundfile as sf
     from ..synth.patch import Note
+    if job_file == "serve":
+        return serve_main()
     job = json.loads(Path(job_file).read_text())
     result = {"ok": False}
     try:
-        host = SerumHost(sr=job.get("sr", 44100))
+        host = _make_host(job.get("sr", 44100))
         result["plugin"] = host.description
         if job.get("mode") == "params":
             tables = {}
@@ -529,8 +615,7 @@ def render_jobs(renders: list[tuple[bytes, list, float]], sr: int = 44100, timeo
     import tempfile
 
     import soundfile as sf
-    if not config.serum_plugin_paths():
-        raise SerumHostError("Serum 2 plugin not found (looked for Serum2.vst3 / Serum2.component)")
+    _require_serum()
     with tempfile.TemporaryDirectory(prefix="fa-serum-") as td:
         td = Path(td)
         job = {"sr": sr, "result": str(td / "result.json"), "renders": []}
@@ -555,6 +640,100 @@ def render_jobs(renders: list[tuple[bytes, list, float]], sr: int = 44100, timeo
             raise SerumHostError(res.get("error", "unknown error"))
         out = [sf.read(r["out"], dtype="float32")[0] for r in job["renders"]]
         return out, res.get("plugin", "")
+
+
+def _require_serum() -> None:
+    import os
+    if not config.serum_plugin_paths() and not os.environ.get("FA_FAKE_SERUM"):
+        raise SerumHostError("Serum 2 plugin not found (looked for Serum2.vst3 / Serum2.component)")
+
+
+class SerumSession:
+    """A long-lived helper process with Serum 2 loaded, for many renders in a
+    row (tuning a patch inside real Serum). Use as a context manager."""
+
+    def __init__(self, sr: int = 44100, start_timeout: float = 180.0):
+        import queue
+        import subprocess
+        import sys
+        import tempfile
+        import threading
+        _require_serum()
+        self.sr = sr
+        self.dir = Path(tempfile.mkdtemp(prefix="fa-serum-session-"))
+        self.err = open(self.dir / "stderr.log", "w")
+        self.proc = subprocess.Popen(
+            [sys.executable, "-m", "fourier_analyzer", "serum-host", "serve"], cwd=str(config.code_dir()),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.err, text=True, bufsize=1)
+        self.replies: queue.Queue = queue.Queue()
+
+        def read():
+            import json
+            for line in self.proc.stdout:
+                if line.startswith(SESSION_TAG):
+                    try:
+                        self.replies.put(json.loads(line[len(SESSION_TAG):]))
+                    except ValueError:
+                        pass
+            self.replies.put(None)                 # process ended
+        threading.Thread(target=read, daemon=True).start()
+        first = self._reply(start_timeout)
+        if not first.get("ok"):
+            self.close()
+            raise SerumHostError(first.get("error", "Serum helper failed to start"))
+        self.plugin = first.get("plugin", "")
+        self.n = 0
+
+    def _reply(self, timeout: float) -> dict:
+        import queue
+        try:
+            r = self.replies.get(timeout=timeout)
+        except queue.Empty:
+            self.close()
+            raise SerumHostError("Serum 2 stopped responding (helper process timed out)")
+        if r is None:
+            tail = ""
+            try:
+                self.err.flush()
+                tail = (self.dir / "stderr.log").read_text()[-1500:]
+            except OSError:
+                pass
+            raise SerumHostError(f"Serum helper process crashed (exit {self.proc.poll()}). {tail}")
+        return r
+
+    def render(self, preset: bytes, notes, duration: float, timeout: float = 90.0) -> np.ndarray:
+        import json
+
+        import soundfile as sf
+        self.n += 1
+        pp, out = self.dir / f"p{self.n % 2}.SerumPreset", self.dir / "r.wav"
+        pp.write_bytes(preset)
+        req = {"preset": str(pp), "duration": float(duration), "out": str(out), "sr": self.sr,
+               "notes": [n.to_dict() if hasattr(n, "to_dict") else n for n in notes]}
+        self.proc.stdin.write(json.dumps(req) + "\n")
+        self.proc.stdin.flush()
+        r = self._reply(timeout)
+        if not r.get("ok"):
+            raise SerumHostError(r.get("error", "render failed"))
+        return sf.read(out, dtype="float32")[0]
+
+    def close(self) -> None:
+        import shutil
+        try:
+            if self.proc.poll() is None:
+                self.proc.stdin.write('{"quit": true}\n')
+                self.proc.stdin.flush()
+                self.proc.wait(timeout=10)
+        except Exception:
+            self.proc.kill()
+        self.err.close()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
 
 def verify(preset: bytes, notes, y_target: np.ndarray, sr: int, gain=None) -> dict:

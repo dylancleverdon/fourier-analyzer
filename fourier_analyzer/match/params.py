@@ -119,6 +119,13 @@ def continuous_params(p: Patch, focus: set[str] | None = None) -> list[Param]:
     if want("env"):
         ps += [Param("envs.0.attack", 0.0005, 0.6, log=True), Param("envs.0.decay", 0.01, 6.0, log=True),
                Param("envs.0.sustain", 0.0, 1.0), Param("envs.0.release", 0.005, 2.0, log=True)]
+        e0 = p.envs[0]
+        if (e0.attack_curve, e0.decay_curve, e0.release_curve) != (0.5, 0.666, 0.666):
+            # curve shapes are searched once the "envelope curves" move turned them on
+            ps += [Param("envs.0.attack_curve", 0.0, 1.0), Param("envs.0.decay_curve", 0.0, 1.0),
+                   Param("envs.0.release_curve", 0.0, 1.0)]
+        if e0.hold > 0:
+            ps.append(Param("envs.0.hold", 0.001, 1.0, log=True))
     used = {m.source for m in p.mods if m.amount}
     if want("mod"):
         for j, m in enumerate(p.mods):

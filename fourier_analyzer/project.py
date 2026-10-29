@@ -44,10 +44,12 @@ class Job:
     detail: dict = field(default_factory=dict)   # live status (what is happening right now)
     finished: float | None = None
     cancel_requested: bool = False
+    cancels: int = 0                 # a reconstruction's 2nd Stop also ends Serum tuning
 
     def cancel(self):
         self.cancel_requested = True
-        self.msg("cancel requested")
+        self.cancels += 1
+        self.msg("stop requested" if self.kind == "reconstruct" else "cancel requested")
 
     def check(self):
         """Abort the job here if the user cancelled it."""
@@ -73,7 +75,7 @@ class Job:
                 "progress": round(self.progress, 3), "stage": self.stage, "best": self.best,
                 "elapsed": round(end - self.created, 1), "detail": d,
                 "log": self.log[-300:], "result": self.result, "error": self.error,
-                "cancel_requested": self.cancel_requested}
+                "cancel_requested": self.cancel_requested, "cancels": self.cancels}
 
 
 def parallel_jobs() -> int:
@@ -371,6 +373,50 @@ def quick_analysis(pid: str, stem: str, start, end, bpm=None) -> dict:
     return s
 
 
+def tune_serum(job: Job, res, opt, bank, y44: np.ndarray, sc: dict, bpm: float, budget_s: float) -> None:
+    """Last stage: fine-tune the patch inside real Serum 2 (best effort)."""
+    from .analysis import sidechain as SC
+    from .match.serum_tune import tune_in_serum
+    from .serum.host import SerumHostError
+    stopped_search = job.cancel_requested
+    stop = (lambda: job.cancels >= 2) if stopped_search else (lambda: job.cancel_requested)
+    if stop():
+        return
+    n = int(round(opt.duration * 44100))
+    y = y44[:n]
+    gain = SC.gain_curve(sc, len(y), 44100) if sc["detected"] else None
+    notes = [nt for nt in (res.notes or opt.notes) if nt.start < opt.duration]
+    job.set("serum tune", "Fine-tuning the patch inside the real Serum 2 plugin", budget=budget_s, elapsed=0,
+            tune_after_stop=stopped_search)
+    job.msg(f"fine-tuning in real Serum 2 for up to {budget_s / 60:.0f} min"
+            + (" (press Stop again to end it)" if stopped_search else ""))
+
+    def prog(text, best, elapsed, extra):
+        job.best = round(best, 2)
+        job.progress = min(0.91, 0.9 + 0.01 * elapsed / max(budget_s, 1))
+        job.detail.update(extra)
+        job.detail["activity"] = f"{extra['evals']} renders in Serum, best {best:.1f}%"
+        if text:
+            job.msg(text)
+    try:
+        patch, info = tune_in_serum(res.patch, bank, notes, y, 44100, budget_s, gain=gain,
+                                    stop=stop, progress=prog)
+    except SerumHostError as e:
+        job.msg(f"Serum tuning skipped: {e}")
+        res.serum_tune = {"ok": False, "error": str(e)}
+        return
+    info.pop("details", None)
+    res.serum_tune = info
+    job.msg(f"Serum tuning: {info['before']}% -> {info['after']}% in real Serum "
+            f"({info['evals']} renders, {info['seconds']:.0f} s)")
+    if patch is not res.patch:
+        res.patch = patch
+        res.details = opt.ref.all(opt.render(patch))
+        res.score = res.details["waveform_similarity"]
+        res.stages.append({"stage": "Serum 2 tuning", "score": info["after"],
+                           "note": f"real Serum score {info['before']} -> {info['after']}"})
+
+
 def start_reconstruct(pid: str, stem: str, start, end, opts: dict) -> Job:
     def work(job: Job):
         from .analysis.features import analyze
@@ -428,6 +474,8 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict) -> Job:
                     "press Stop to finish with the best patch so far")
         opt = Optimizer(y22, OPT_SR, a, o, bank=bank, progress=prog, context_gain=gain22)
         res = opt.run()
+        if opts.get("serum_tune", False) and float(opts.get("serum_tune_minutes") or 0) > 0:
+            tune_serum(job, res, opt, bank, y44, sc, bpm, float(opts["serum_tune_minutes"]) * 60)
         d = res.details
         job.msg(f"waveform similarity {d['waveform_similarity']}%, spectral similarity "
                 f"{d['spectral_similarity']}%, SI-SDR {d['si_sdr_db']} dB; running checks")
@@ -478,7 +526,7 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict) -> Job:
             "sidechain": {k: v for k, v in sc.items() if k != "kicks"},
             "sidechain_logic": SC.logic_settings(sc),
             "patch": res.patch.to_dict(), "description": res.patch.describe(), "stages": res.stages,
-            "checks": checks, "serum": serum, "analysis": a.summary(), "evals": opt.evals,
+            "checks": checks, "serum": serum, "serum_tune": getattr(res, "serum_tune", None), "analysis": a.summary(), "evals": opt.evals,
             "files": sorted(p.name for p in out.iterdir()),
         }
         exp = config.exports_dir() / meta["name"][:60] / f"{stem} {rid}"

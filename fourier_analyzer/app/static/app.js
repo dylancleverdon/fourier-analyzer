@@ -616,6 +616,7 @@ $("#runRecon").onclick = async () => {
     stem: state.stem, ...selRange(), bpm: parseFloat($("#bpm").value) || null,
     target: parseFloat($("#target").value), time_budget: budgetSeconds(),
     keep_going: $("#keepGoing").checked, sidechain_in_preset: $("#scInPreset").checked,
+    serum_tune: $("#serumTune").checked, serum_tune_minutes: parseFloat($("#serumTuneMin").value),
     verify_serum: $("#verifySerum").checked,
   };
   if (!body.start && state.duration > 12 && !confirm("No selection: the whole stem will be used (only the first 6 s drive the search). Continue?")) return;
@@ -674,7 +675,9 @@ function showJob(j) {
   $("#jobBox").hidden = false;
   const d = j.detail || {};
   const kind = { reconstruct: "Reconstructing patch", separate: "Separating stems", split: "Splitting layers", calibrate: "Calibrating" }[j.kind] || j.kind || "";
-  const stopping = j.cancel_requested && j.status === "running";
+  // a reconstruction's first Stop ends the search (Serum tuning still runs); a second ends the tuning
+  const tuning = j.kind === "reconstruct" && j.stage === "serum tune";
+  const stopping = j.status === "running" && (tuning ? j.cancels >= 2 || (j.cancels >= 1 && !d.tune_after_stop) : j.cancel_requested);
   $("#jobStage").textContent = `${kind}${j.status === "done" ? " · done" : j.status === "cancelled" ? " · cancelled" : stopping ? " · stopping…" : ""}`;
   let timing = `running ${clock(j.elapsed)}`;
   if (j.status === "done" || j.status === "cancelled") timing = `finished in ${clock(j.elapsed)}`;
@@ -682,8 +685,8 @@ function showJob(j) {
   else if (d.budget && d.elapsed != null) timing += ` · search ${clock(d.elapsed)} of ${clock(d.budget)} (~${clock(d.budget - d.elapsed)} left)`;
   const cb = $("#jobCancel");
   cb.hidden = !(j.status === "queued" || j.status === "running");
-  cb.disabled = !!j.cancel_requested;
-  cb.textContent = j.kind === "reconstruct" ? (stopping ? "Stopping…" : "Stop (keep best)") : (stopping ? "Cancelling…" : "Cancel");
+  cb.disabled = stopping || (!tuning && !!j.cancel_requested);
+  cb.textContent = j.kind === "reconstruct" ? (stopping ? "Stopping…" : tuning ? "Stop Serum tuning" : "Stop (keep best)") : (stopping ? "Cancelling…" : "Cancel");
   cb.onclick = async () => {
     if (j.kind !== "reconstruct" && !confirm("Cancel this job? Its progress will be lost.")) return;
     cb.disabled = true;

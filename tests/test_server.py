@@ -35,7 +35,8 @@ def _wait(c, jid, timeout=180):
     raise AssertionError("job timed out")
 
 
-def test_full_flow():
+def test_full_flow(monkeypatch):
+    monkeypatch.setenv("FA_FAKE_SERUM", "cutoff:0.8")    # our engine stands in for Serum 2
     c = TestClient(app)
     assert c.get("/").status_code == 200
     assert "version" in c.get("/api/system").json()
@@ -59,13 +60,17 @@ def test_full_flow():
     assert a.status_code == 200, a.text
     assert len(a.json()["notes"]) >= 1
     rr = c.post(f"/api/projects/{pid}/reconstruct",
-                json={"stem": "bass", "start": 0.0, "end": 1.9, "time_budget": 15, "verify_serum": False})
+                json={"stem": "bass", "start": 0.0, "end": 1.9, "time_budget": 15, "verify_serum": True,
+                      "serum_tune": True, "serum_tune_minutes": 0.25})
     j = _wait(c, rr.json()["job"], timeout=300)
     assert j["status"] == "done", j.get("error")
     res = j["result"]
     assert any(f.endswith(".SerumPreset") for f in res["files"])
     assert {"waveform_similarity", "spectral_similarity", "si_sdr_db"} <= set(res["details"])
     assert "sidechain" in res and res["patch"]["oscs"][0]["table"].startswith("custom:")
+    assert res["serum_tune"]["ok"] and res["serum_tune"]["evals"] > 5, res["serum_tune"]
+    assert res["serum_tune"]["after"] >= res["serum_tune"]["before"]
+    assert res["serum"]["ok"], res["serum"]
     f = c.get(f"/api/projects/{pid}/results/{res['id']}/file/notes.mid")
     assert f.status_code == 200
 

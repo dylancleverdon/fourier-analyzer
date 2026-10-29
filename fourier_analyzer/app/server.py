@@ -362,6 +362,8 @@ class RegionIn(BaseModel):
     time_budget: float = 240.0          # seconds; 0 = until the user presses Stop
     keep_going: bool = False            # keep improving after reaching the target
     sidechain_in_preset: bool = False   # write the detected ducking into the preset (LFO -> Voice Amp)
+    serum_tune: bool = True             # fine-tune the finished patch inside real Serum 2
+    serum_tune_minutes: float = 5.0
     verify_serum: bool = True
 
 

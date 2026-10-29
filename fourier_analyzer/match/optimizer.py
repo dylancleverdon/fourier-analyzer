@@ -458,6 +458,31 @@ class Optimizer:
                     q.oscs[0].warp2, q.oscs[0].warp2_amount = code, 0.3
                     return q
                 mv(f"second warp {code} on osc A", f, {"osc"})
+        if o0.unison > 1 and o0.unison_mode == "linear":
+            for mode in ("super", "exp", "inv", "random"):
+                def f(q, mode=mode):
+                    q.oscs[0].unison_mode = mode
+                    return q
+                mv(f"unison detune mode {mode}", f, {"osc"})
+        for i in (1, 2):                       # phase warps on osc B / C
+            oi = p.oscs[i]
+            if oi.enabled and oi.level > 0 and oi.warp == "none":
+                for code in ("Sync", "BendPos", "PWM", "SelfPD", "DistSoft"):
+                    def f(q, i=i, code=code):
+                        q.oscs[i].warp, q.oscs[i].warp_amount = code, 0.3
+                        return q
+                    mv(f"warp {code} on osc {'ABC'[i]}", f, {"osc"})
+        e0 = p.envs[0]
+        if (e0.attack_curve, e0.decay_curve, e0.release_curve) == (0.5, 0.666, 0.666):
+            def f(q):
+                q.envs[0].attack_curve, q.envs[0].decay_curve, q.envs[0].release_curve = 0.45, 0.62, 0.62
+                return q
+            mv("amp envelope curve shapes", f, {"env"})
+        if e0.hold == 0 and e0.sustain < 0.9:
+            def f(q):
+                q.envs[0].hold = 0.02
+                return q
+            mv("amp envelope hold", f, {"env"})
         if o0.unison > 1 and o0.unison_stack == "none":
             for stack in ("Octave1", "OctaveFifth1", "Center12"):
                 def f(q, stack=stack):

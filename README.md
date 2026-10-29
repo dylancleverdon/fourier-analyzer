@@ -59,10 +59,13 @@ There is deliberately no signing or checksum verification; update speed was prio
       - Serum filter models (Ladder, Comb, Phase, Flange, Formant, Diffuser, Scream, morphing) and a parallel filter 2
       - FX-rack modules: distortion modes, chorus, flanger, phaser, hyperdimension, frequency shifter, FX filter, compressor, reverb, convolve and tempo-synced delay, plus a multiband split
       - OTT, EQ and glide
+      - unison detune modes, warps on osc B and C, amp-envelope curve shapes and hold
    3. **Pruning** removes each component in turn and drops it if the fit holds.
    4. **Fine-tuning** of every parameter with CMA-ES.
    5. **Exploration** (search times over 15 min): after the first full pass (about 15 min), the search keeps experimenting until the time runs out: fresh rounds of structure moves, pruning and CMA-ES restarts, keeping only what improves the fit.
    6. **Waveform alignment**: start phase, fine tune, the amp envelope and each note's start time (±6 ms) are tuned to maximise literal waveform correlation. The refined note timing also goes into the exported MIDI.
+
+   7. **Fine-tune inside real Serum 2** (on by default, 2 min to 1 hour, skipped when Serum 2 isn't installed): the main search runs on the app's own copy of Serum's engine, which is fast but approximate. This stage keeps one copy of the real plugin open, renders candidate presets in it over and over, scores each against the original and nudges every continuous parameter with CMA-ES. It restarts whenever it converges, so it keeps working for the time you give it, and it never makes the result worse. The first **Stop** ends the main search and moves on to this stage; a second Stop ends it.
 
    **Search time** goes from 1.5 min to 8 hours, a custom number of minutes, or **Until I stop it**. Tick **keep improving after reaching the target** so a long run doesn't stop at the similarity target.
 
