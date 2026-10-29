@@ -19,6 +19,7 @@ imageio-ffmpeg>=0.5
 # source separation (Demucs v4 + MDX23C DrumSep) - pulls in torch with Apple-GPU (MPS) support
 audio-separator[cpu]>=0.30
 onnxruntime>=1.17
+audioread>=3.0   # audio-separator imports it; librosa >=0.11 no longer pulls it in
 # hosting the real Serum 2 plugin for verification/calibration
 pedalboard>=0.9.14
 # native window
