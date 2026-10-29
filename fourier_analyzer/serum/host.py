@@ -213,12 +213,66 @@ def describe_blob(blob: bytes, depth: int = 0) -> str:
     return "; ".join(parts)
 
 
+def _deep_merge(old, ours):
+    """Our values written over Serum's current state, keeping every key and
+    structure Serum's own (newer) format has that our patch doesn't mention."""
+    import copy
+    if isinstance(old, dict) and isinstance(ours, dict):
+        out = copy.copy(old)
+        for k, v in ours.items():
+            out[k] = _deep_merge(old[k], v) if k in old else v
+        return out
+    return ours
+
+
+def _rebuild_container(old: bytes, preset: bytes) -> bytes:
+    """New XferJson container in the *plugin's own* format: keep the existing
+    header (Serum 2.1+ uses a component header and format version 11, not
+    the .SerumPreset file header) and merge our state into its CBOR."""
+    import hashlib
+    import json
+
+    import zstandard
+    from .preset import encode_state, read_preset_bytes
+    pos = len(MAGIC)
+    (jlen,) = struct.unpack_from("<Q", old, pos)
+    header = json.loads(old[pos + 8:pos + 8 + jlen].decode("utf-8"))
+    pos += 8 + jlen
+    usize, ver = struct.unpack_from("<II", old, pos)
+    raw = zstandard.ZstdDecompressor().decompressobj().decompress(old[pos + 8:])
+    import cbor2
+    base_state = cbor2.loads(raw)
+    _, ours = read_preset_bytes(preset)
+    merged = _deep_merge(base_state, {k: v for k, v in ours.items()
+                                      if k not in ("presetAuthor", "presetDescription", "tags", "hash",
+                                                   "product", "productVersion", "version", "vendor",
+                                                   "url", "fileType")})
+    payload = encode_state(merged)
+    comp = zstandard.ZstdCompressor(level=3).compress(payload)
+    if "hash" in header:
+        header["hash"] = hashlib.md5(comp).hexdigest()
+    hjson = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    return MAGIC + struct.pack("<Q", len(hjson)) + hjson + struct.pack("<II", len(payload), ver) + comp
+
+
+# which container strategy to use: "merge" (Serum's header + merged state)
+# or "replace" (our .SerumPreset container as-is)
+SWAP_MODE = {"mode": "merge"}
+
+
 def _swap(blob: bytes, preset: bytes) -> bytes | None:
     k = blob.find(MAGIC)
     if k < 0:
         return _swap_payload(blob, preset)
     old_len = _preset_len(blob, k)
-    new = blob[:k] + preset + blob[k + old_len:]
+    replacement = preset
+    if SWAP_MODE["mode"] == "merge":
+        try:
+            replacement = _rebuild_container(blob[k:k + old_len], preset)
+        except Exception as e:
+            log.warning("merge into plugin state failed (%s); replacing container", e)
+    new = blob[:k] + replacement + blob[k + old_len:]
+    preset = replacement
     # fix a length prefix just before the container, if there is one
     for fmt, size in (("<Q", 8), ("<I", 4), (">I", 4)):
         if k >= size:
@@ -329,7 +383,8 @@ class SerumHost:
     def load_preset(self, preset: bytes) -> None:
         import time
         attempts = []
-        for drop in (True, False):
+        for mode, drop in (("merge", True), ("merge", False), ("replace", True), ("replace", False)):
+            SWAP_MODE["mode"] = mode
             if self.base_state[:4] == b"VC2!":
                 new = _swap_vc2(self.base_state, preset, drop_controller=drop)
             elif drop:
@@ -341,7 +396,8 @@ class SerumHost:
             try:
                 self.plugin.raw_state = new
             except Exception as e:
-                attempts.append((drop, new, None, f"setting state raised {type(e).__name__}: {e}"))
+                attempts.append((f"{mode}, drop_controller={drop}", new, None,
+                                 f"setting state raised {type(e).__name__}: {e}"))
                 continue
             # confirm Serum took it: its state must stop being the init patch.
             # Serum 2 may load in the background, so give it up to ~3 s.
@@ -352,7 +408,7 @@ class SerumHost:
                 if after != self.base_state:
                     return
                 time.sleep(0.1)
-            attempts.append((drop, new, after, "state unchanged after 3 s"))
+            attempts.append((f"{mode}, drop_controller={drop}", new, after, "state unchanged after 3 s"))
         diag = self._write_diagnostics(preset, attempts)
         if not attempts:
             raise SerumHostError("could not find Serum's preset data in the plugin state ("
@@ -361,11 +417,11 @@ class SerumHost:
                              f"Please send {diag}")
 
     def _write_diagnostics(self, preset: bytes, attempts) -> Path:
-        path = config.app_dir() / "serum_diagnostics.txt"
+        path = config.diagnostics_path()
         lines = [f"plugin: {getattr(self, 'description', '?')}",
                  f"base state: {describe_blob(self.base_state)}"]
         for drop, new, after, why in attempts:
-            lines.append(f"--- attempt drop_controller={drop}: {why}")
+            lines.append(f"--- attempt {drop}: {why}")
             lines.append(f"injected: {describe_blob(new)}")
             if after is not None:
                 lines.append(f"after:    {describe_blob(after)}")
@@ -408,6 +464,20 @@ class SerumHost:
 # plugin crash cannot take the app down
 
 
+def _parse_value(text: str):
+    """'1.25 kHz' -> 1250.0, '12.0 ms' -> 0.012, '440 Hz' -> 440.0, '35 %' -> 35.0."""
+    m = re.search(r"(-?\d+(?:\.\d+)?)\s*([kKmM]?)(Hz|hz|s|%|dB|st|ct)?", text or "")
+    if not m:
+        return None
+    v = float(m.group(1))
+    pre, unit = m.group(2), (m.group(3) or "")
+    if unit.lower() == "hz" and pre in "kK" and pre:
+        v *= 1000.0
+    if unit == "s" and pre == "m":
+        v /= 1000.0
+    return v
+
+
 def host_main(job_file: str) -> int:
     """Entry point of ``python -m fourier_analyzer serum-host job.json``."""
     import json
@@ -419,6 +489,23 @@ def host_main(job_file: str) -> int:
     try:
         host = SerumHost(sr=job.get("sr", 44100))
         result["plugin"] = host.description
+        if job.get("mode") == "params":
+            tables = {}
+            params = host.plugin.parameters
+            for name in job["params"]:
+                if name not in params:
+                    continue
+                prm = params[name]
+                rows = []
+                for x in np.linspace(0.0, 1.0, int(job.get("steps", 41))):
+                    prm.raw_value = float(x)
+                    text = getattr(prm, "string_value", None) or str(prm)
+                    rows.append([float(x), text, _parse_value(text)])
+                tables[name] = rows
+            result["tables"] = tables
+            result["ok"] = True
+            Path(job["result"]).write_text(json.dumps(result))
+            return 0
         for r in job["renders"]:
             host.load_preset(Path(r["preset"]).read_bytes())
             notes = [Note(**n) for n in r["notes"]]
@@ -484,6 +571,58 @@ def verify(preset: bytes, notes, y_target: np.ndarray, sr: int, gain=None) -> di
     except Exception as e:
         log.warning("Serum verification unavailable: %s", e)
         return {"ok": False, "error": str(e)}
+
+
+CALIBRATE_PARAMS = ("filter_1_freq_hz", "env_1_attack", "env_1_decay", "env_1_release", "env_1_sustain",
+                    "lfo_1_rate", "a_uni_detune", "a_wt_pos", "a_level")
+
+
+def query_params(names, steps: int = 41) -> tuple[dict, str]:
+    """Sweep plugin parameters 0..1 in the helper process and return
+    {name: [[raw, display text, parsed SI value], ...]}."""
+    import json
+    import subprocess
+    import sys
+    import tempfile
+    if not config.serum_plugin_paths():
+        raise SerumHostError("Serum 2 plugin not found (looked for Serum2.vst3 / Serum2.component)")
+    with tempfile.TemporaryDirectory(prefix="fa-serum-") as td:
+        td = Path(td)
+        job = {"mode": "params", "params": list(names), "steps": steps, "result": str(td / "result.json")}
+        (td / "job.json").write_text(json.dumps(job))
+        proc = subprocess.run([sys.executable, "-m", "fourier_analyzer", "serum-host", str(td / "job.json")],
+                              cwd=str(config.code_dir()), capture_output=True, text=True, timeout=120)
+        if not (td / "result.json").exists():
+            raise SerumHostError(f"Serum helper process crashed (exit {proc.returncode}). "
+                                 + (proc.stderr or proc.stdout or "")[-1500:])
+        res = json.loads((td / "result.json").read_text())
+        if not res.get("ok"):
+            raise SerumHostError(res.get("error", "unknown error"))
+        return res["tables"], res.get("plugin", "")
+
+
+def calibrate(progress=None) -> dict:
+    """Read Serum's own value displays while sweeping its parameters: this
+    gives the exact normalised->Hz cutoff curve (and env/LFO/detune tables)
+    without rendering audio or loading presets."""
+    if progress:
+        progress("reading Serum 2 parameter curves (helper process)")
+    tables, plugin = query_params(CALIBRATE_PARAMS)
+    if progress:
+        progress(f"loaded {plugin}; got {len(tables)} parameter curves")
+    cut = [(x, v) for x, _, v in tables.get("filter_1_freq_hz", []) if v and v > 0]
+    if len(cut) < 5:
+        sample = tables.get("filter_1_freq_hz", [])[:5]
+        raise SerumHostError(f"could not read Serum's cutoff values (sample: {sample})")
+    s = config.settings().get("serum_scales", {})
+    s["cutoff_table"] = [[round(x, 5), round(v, 3)] for x, v in cut]
+    s["cutoff_lo_hz"], s["cutoff_hi_hz"] = float(cut[0][1]), float(cut[-1][1])
+    config.save_settings(serum_scales=s, serum_param_tables=tables)
+    if progress:
+        for x, v in cut[::8]:
+            progress(f"cutoff {x:.2f} -> {v:.1f} Hz")
+    return {"plugin": plugin, "cutoff_hz_at_0": cut[0][1], "cutoff_hz_at_0.5": dict(cut).get(0.5),
+            "cutoff_hz_at_1": cut[-1][1], "params_read": sorted(tables)}
 
 
 def calibrate_cutoff(progress=None) -> dict:

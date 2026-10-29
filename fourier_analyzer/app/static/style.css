@@ -146,3 +146,5 @@ dialog menu { display: flex; justify-content: flex-end; gap: 8px; padding: 0; ma
 .projects .del { visibility: hidden; border: none; background: transparent; color: var(--muted); padding: 0 6px; font-size: 16px; }
 .projects li:hover .del { visibility: visible; }
 .projects .del:hover { color: var(--bad); }
+.pick { display: flex; gap: 6px; margin-top: 4px; }
+.pick input { flex: 1; margin-top: 0 !important; }

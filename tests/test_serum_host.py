@@ -139,3 +139,37 @@ def test_controller_dropped_and_ignored_state_reports_diagnostics(monkeypatch, t
     assert "serum_diagnostics.txt" in str(e.value)
     text = (tmp_path / "serum_diagnostics.txt").read_text()
     assert "Fil Cutoff" in text and "drop_controller=True" in text
+
+
+def test_parse_values_and_cutoff_table(monkeypatch):
+    assert host._parse_value("1.25 kHz") == 1250.0
+    assert host._parse_value("440 Hz") == 440.0
+    assert abs(host._parse_value("12.0 ms") - 0.012) < 1e-9
+    from fourier_analyzer.serum import mapping
+    sc = dict(mapping.SCALES, cutoff_table=[[0.0, 20.0], [0.25, 100.0], [0.5, 1000.0], [0.75, 5000.0], [1.0, 20000.0]])
+    assert abs(mapping.cutoff_to_norm(1000.0, sc) - 0.5) < 1e-6
+
+
+def test_merge_keeps_serum_header_and_new_keys():
+    import json
+    import struct
+
+    import cbor2
+    import zstandard
+
+    from fourier_analyzer.serum.mapping import load_skeleton, patch_to_state
+    from fourier_analyzer.serum.preset import MAGIC, encode_state, write_preset_bytes
+    from fourier_analyzer.synth.patch import Filter, Patch
+    base_state = dict(load_skeleton(), NewV11Module={"plainParams": "default"})
+    payload = encode_state(base_state)
+    comp = zstandard.ZstdCompressor().compress(payload)
+    hdr = json.dumps({"component": "processor", "productVersion": "2.1.5", "version": 11.0}).encode()
+    old = MAGIC + struct.pack("<Q", len(hdr)) + hdr + struct.pack("<II", len(payload), 2) + comp
+    p = Patch()
+    p.filter = Filter(enabled=True, cutoff=1234)
+    new = host._rebuild_container(old, write_preset_bytes(patch_to_state(p), "t"))
+    (jl,) = struct.unpack_from("<Q", new, len(MAGIC))
+    h = json.loads(new[len(MAGIC) + 8:len(MAGIC) + 8 + jl])
+    assert h["component"] == "processor" and h["version"] == 11.0
+    st = cbor2.loads(zstandard.ZstdDecompressor().decompressobj().decompress(new[len(MAGIC) + 8 + jl + 8:]))
+    assert "NewV11Module" in st and st["VoiceFilter0"]["plainParams"]["kParamEnable"] == 1.0

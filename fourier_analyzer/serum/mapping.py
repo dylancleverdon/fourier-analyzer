@@ -67,6 +67,12 @@ def scales() -> dict:
 
 def cutoff_to_norm(hz: float, sc: dict | None = None) -> float:
     sc = sc or scales()
+    table = sc.get("cutoff_table")
+    if table and len(table) >= 5:          # measured in Serum by "Calibrate"
+        xs = np.array([r[0] for r in table], dtype=float)
+        hzs = np.log(np.array([r[1] for r in table], dtype=float))
+        order = np.argsort(hzs)
+        return float(np.clip(np.interp(np.log(max(hz, 1e-3)), hzs[order], xs[order]), 0.0, 1.0))
     lo, hi = sc["cutoff_lo_hz"], sc["cutoff_hi_hz"]
     return float(np.clip(math.log(max(hz, lo) / lo) / math.log(hi / lo), 0.0, 1.0))
 

@@ -70,8 +70,8 @@ def main(argv=None):
         from .separation.stems import prefetch_models
         print(prefetch_models(progress=print))
     elif cmd == "calibrate":
-        from .serum.host import calibrate_cutoff
-        print(json.dumps(calibrate_cutoff(progress=print), indent=1, default=str))
+        from .serum.host import calibrate
+        print(json.dumps(calibrate(progress=print), indent=1, default=str))
     elif cmd == "serum-host":
         from .serum.host import host_main
         sys.exit(host_main(args.job))

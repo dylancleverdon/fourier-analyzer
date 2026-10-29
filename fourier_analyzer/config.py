@@ -52,11 +52,24 @@ def projects_dir() -> Path:
     return p
 
 
+def default_exports_dir() -> Path:
+    return Path.home() / "Music" / "Fourier Analyzer" if sys.platform == "darwin" else data_dir() / "exports"
+
+
 def exports_dir() -> Path:
-    """User-visible export folder."""
-    p = Path.home() / "Music" / "Fourier Analyzer" if sys.platform == "darwin" else data_dir() / "exports"
-    p.mkdir(parents=True, exist_ok=True)
+    """User-visible export folder (Settings -> Export folder)."""
+    s = settings().get("export_dir")
+    p = Path(s).expanduser() if s else default_exports_dir()
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        p = default_exports_dir()
+        p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def diagnostics_path() -> Path:
+    return app_dir() / "serum_diagnostics.txt"
 
 
 def version() -> str:
@@ -132,7 +145,16 @@ def serum_presets_dir() -> Path | None:
 
 
 def serum_user_presets_dir() -> Path:
-    """Where exported presets get copied so they show up in Serum's browser."""
+    """Where exported presets get copied so they show up in Serum's browser
+    (Settings -> Install presets into)."""
+    custom = settings().get("serum_preset_install_dir")
+    if custom:
+        p = Path(custom).expanduser()
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+        except OSError:
+            pass
     base = serum_presets_dir()
     if base is not None:
         p = base / "User" / "Fourier Analyzer"

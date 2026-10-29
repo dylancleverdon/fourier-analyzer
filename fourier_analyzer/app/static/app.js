@@ -665,13 +665,31 @@ $("#settingsBtn").onclick = async () => {
   ch.value = st.update_channel || "release";
   $("#setAuto").checked = st.auto_update !== false;
   $("#setTables").value = st.serum_tables_dir || ""; $("#setPlugin").value = st.serum_plugin_path || "";
+  $("#setInstallDir").value = st.serum_preset_install_dir || ""; $("#setInstallDir").placeholder = s.preset_install_dir;
+  $("#setExportDir").value = st.export_dir || ""; $("#setExportDir").placeholder = s.exports;
+  $("#diagRow").hidden = !s.diagnostics;
   $("#settings").showModal();
 };
 $("#saveSettings").onclick = async () => {
-  await post("/api/settings", { values: { update_channel: $("#setChannel").value, auto_update: $("#setAuto").checked, serum_tables_dir: $("#setTables").value.trim(), serum_plugin_path: $("#setPlugin").value.trim() } });
+  await post("/api/settings", { values: { update_channel: $("#setChannel").value, auto_update: $("#setAuto").checked, serum_tables_dir: $("#setTables").value.trim(), serum_plugin_path: $("#setPlugin").value.trim(), serum_preset_install_dir: $("#setInstallDir").value.trim(), export_dir: $("#setExportDir").value.trim() } });
   checkUpdate();
 };
-$("#calibrateBtn").onclick = async () => { const r = await post("/api/calibrate"); $("#settings").close(); pollJob(r.job, (j) => alert(j.status === "done" ? "Calibrated: " + JSON.stringify(j.result) : "Calibration failed: " + j.error)); };
+$("#calibrateBtn").onclick = async () => {
+  const r = await post("/api/calibrate"); $("#settings").close();
+  pollJob(r.job, async (j) => {
+    if (j.status === "done") { alert("Calibrated: " + JSON.stringify(j.result)); return; }
+    // show the diagnostics file in Finder so it is easy to find and send
+    let where = "";
+    try { where = (await post("/api/diagnostics/reveal")).path; } catch (e) { /* none written */ }
+    alert("Calibration failed: " + j.error + (where ? `\n\nThe diagnostics file is now selected in Finder:\n${where}\n\nYou can also download it from Settings.` : ""));
+  });
+};
+document.querySelectorAll("[data-pick]").forEach((b) => b.onclick = async () => {
+  const input = $("#" + b.dataset.pick);
+  const r = await post("/api/pick-folder", { prompt: "Choose a folder", start: input.value || input.placeholder });
+  if (r.path) input.value = r.path;
+});
+$("#diagReveal").onclick = () => post("/api/diagnostics/reveal");
 function renderBpmAlts() {
   const box = $("#bpmAlts"); box.innerHTML = "";
   const c = (state.meta.bpm_candidates || []).filter((x) => Math.abs(x - parseFloat($("#bpm").value)) > 0.01).slice(0, 4);

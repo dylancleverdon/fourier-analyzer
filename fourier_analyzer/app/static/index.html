@@ -192,7 +192,16 @@
     </label>
     <label class="check"><input id="setAuto" type="checkbox"> install updates automatically on launch</label>
     <label>Serum tables folder (blank = auto)<input id="setTables" type="text" placeholder="~/Documents/Xfer/Serum 2 Presets/Tables"></label>
-    <label>Serum 2 plugin path (blank = auto)<input id="setPlugin" type="text" placeholder="/Library/Audio/Plug-Ins/Components/Serum2.component"></label>
+    <label>Serum 2 plugin path (blank = auto)<input id="setPlugin" type="text" placeholder="/Library/Audio/Plug-Ins/VST3/Serum2.vst3"></label>
+    <label>"Install into Serum 2" puts presets in
+      <span class="pick"><input id="setInstallDir" type="text" placeholder="Serum 2 Presets/Presets/User/Fourier Analyzer"><button type="button" class="ghost" data-pick="setInstallDir">Choose…</button></span></label>
+    <label>Export folder (presets, MIDI, renders)
+      <span class="pick"><input id="setExportDir" type="text" placeholder="~/Music/Fourier Analyzer"><button type="button" class="ghost" data-pick="setExportDir">Choose…</button></span></label>
+    <div class="row" id="diagRow" hidden>
+      <span class="small">Serum diagnostics:</span>
+      <button id="diagReveal" type="button" class="ghost">Show in Finder</button>
+      <a id="diagDownload" class="btn ghost" href="/api/diagnostics" download="serum_diagnostics.txt">Download</a>
+    </div>
     <div class="row">
       <button id="calibrateBtn" type="button" class="ghost">Calibrate with Serum 2</button>
       <span class="muted small">Measures Serum's filter-cutoff curve so presets match exactly.</span>

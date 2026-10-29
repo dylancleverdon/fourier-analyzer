@@ -49,8 +49,61 @@ def system():
         "serum_tables": str(config.serum_tables_dir() or ""),
         "serum_presets": str(config.serum_presets_dir() or ""),
         "exports": str(config.exports_dir()),
+        "preset_install_dir": str(config.serum_user_presets_dir()),
+        "diagnostics": str(config.diagnostics_path()) if config.diagnostics_path().exists() else "",
         "settings": config.settings(),
     }
+
+
+class PickIn(BaseModel):
+    prompt: str = "Choose a folder"
+    start: str | None = None
+
+
+@app.post("/api/pick-folder")
+def pick_folder(body: PickIn):
+    """Native folder chooser (macOS Finder dialog)."""
+    import subprocess
+    import sys
+    if sys.platform == "darwin":
+        start = body.start if body.start and Path(body.start).expanduser().exists() else str(Path.home())
+        script = [
+            "tell application \"System Events\"", "activate",
+            f"set f to choose folder with prompt \"{body.prompt}\" default location (POSIX file \"{start}\")",
+            "end tell", "POSIX path of f"]
+        args = ["osascript"]
+        for line in script:
+            args += ["-e", line]
+        r = subprocess.run(args, capture_output=True, text=True)
+        if r.returncode != 0:
+            return {"cancelled": True}
+        return {"path": r.stdout.strip().rstrip("/")}
+    try:
+        import webview
+        res = webview.windows[0].create_file_dialog(getattr(webview, "FOLDER_DIALOG", 20))
+        return {"path": res[0]} if res else {"cancelled": True}
+    except Exception as e:
+        raise HTTPException(501, f"no folder dialog available: {e}")
+
+
+@app.get("/api/diagnostics")
+def diagnostics_file():
+    p = config.diagnostics_path()
+    if not p.exists():
+        raise HTTPException(404, "no diagnostics yet (run Calibrate with Serum 2 first)")
+    return FileResponse(p, filename="serum_diagnostics.txt", media_type="text/plain")
+
+
+@app.post("/api/diagnostics/reveal")
+def reveal_diagnostics():
+    import subprocess
+    import sys
+    p = config.diagnostics_path()
+    if not p.exists():
+        raise HTTPException(404, "no diagnostics yet")
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", "-R", str(p)])
+    return {"path": str(p)}
 
 
 class SettingsIn(BaseModel):
@@ -360,8 +413,8 @@ def reveal(pid: str, rid: str):
 
 @app.post("/api/calibrate")
 def calibrate():
-    from ..serum.host import calibrate_cutoff
+    from ..serum.host import calibrate
 
     def work(job):
-        return calibrate_cutoff(progress=job.msg)
+        return calibrate(progress=job.msg)
     return {"job": project.JOBS.submit("calibrate", work).id}
