@@ -41,7 +41,7 @@ main { overflow: auto; padding: 20px 24px 60px; }
 .drop:hover, .drop.over { border-color: var(--accent); background: rgba(255, 138, 61, .06); }
 .drop-icon { font-size: 26px; color: var(--accent); }
 .projects { list-style: none; margin: 0; padding: 0; }
-.projects li { padding: 7px 8px; border-radius: 6px; cursor: pointer; white-space: nowrap; overflow: hidden;
+.projects li { display: flex; align-items: center; gap: 6px; padding: 7px 8px; border-radius: 6px; cursor: pointer; white-space: nowrap; overflow: hidden;
   text-overflow: ellipsis; }
 .projects li:hover, .projects li.active { background: var(--panel2); }
 .check { display: flex; gap: 6px; align-items: center; margin: 8px 0; }
@@ -65,7 +65,7 @@ main { overflow: auto; padding: 20px 24px 60px; }
 .chip.off { opacity: .45; }
 
 .stems { display: grid; gap: 6px; }
-.stem { display: grid; grid-template-columns: 34px 1fr auto; align-items: center; gap: 10px; padding: 6px 8px;
+.stem { display: grid; grid-template-columns: 18px 34px 1fr auto; align-items: center; gap: 10px; padding: 6px 8px;
   border-radius: 8px; border: 1px solid transparent; }
 .stem:hover { background: var(--panel2); }
 .stem.active { border-color: var(--accent); background: rgba(255, 138, 61, .06); }
@@ -88,6 +88,7 @@ main { overflow: auto; padding: 20px 24px 60px; }
 
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+#roll { width: 100%; height: 200px; background: #0b0d11; border-radius: 8px; display: block; }
 canvas.chart, #specChart, #harmChart { width: 100%; height: 220px; background: #0b0d11; border-radius: 8px; display: block; }
 .kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 13px; }
 .kv span:nth-child(odd) { color: var(--muted); }
@@ -136,3 +137,9 @@ dialog menu { display: flex; justify-content: flex-end; gap: 8px; padding: 0; ma
 .bpm-alts { display: flex; gap: 4px; align-items: center; }
 .bpm-alts .pill { padding: 2px 8px; }
 .warnbox { margin-top: 8px; padding: 8px 12px; border: 1px solid var(--warn); border-radius: 8px; color: var(--warn); display: flex; gap: 12px; align-items: center; }
+.tick { display: flex; align-items: center; justify-content: center; }
+.tick input { accent-color: var(--accent); }
+.projects .pname { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.projects .del { visibility: hidden; border: none; background: transparent; color: var(--muted); padding: 0 6px; font-size: 16px; }
+.projects li:hover .del { visibility: visible; }
+.projects .del:hover { color: var(--bad); }

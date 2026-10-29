@@ -92,10 +92,13 @@ echo "app version $VERSION"
 # ---------------------------------------------------------------- 3. venv + deps
 step "3/7  Python $PY_VERSION environment + dependencies (this takes a few minutes the first time)"
 if [ ! -x "$HOME_DIR/venv/bin/python" ]; then
-  uv venv --python "$PY_VERSION" "$HOME_DIR/venv"
+  uv venv --seed --python "$PY_VERSION" "$HOME_DIR/venv"
 fi
 uv pip install --python "$HOME_DIR/venv/bin/python" -r "$HOME_DIR/app/requirements.txt"
 uv pip install --python "$HOME_DIR/venv/bin/python" imageio-ffmpeg
+# verify the separation stack imports (catches missing transitive deps early)
+"$HOME_DIR/venv/bin/python" -c "import onnxruntime, audioread; from audio_separator.separator import Separator; print('separation stack OK')" \
+  || { warn "separation stack incomplete; retrying install"; uv pip install --python "$HOME_DIR/venv/bin/python" --reinstall -r "$HOME_DIR/app/requirements.txt"; }
 FFMPEG="$("$HOME_DIR/venv/bin/python" -c 'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())')"
 ln -sf "$FFMPEG" "$HOME_DIR/venv/bin/ffmpeg"
 echo "ffmpeg: $FFMPEG"
@@ -156,13 +159,6 @@ print("Serum tables   :", config.serum_tables_dir() or "NOT FOUND (set it in Set
 print("Serum presets  :", config.serum_presets_dir() or "NOT FOUND")
 config.save_settings(update_channel=config.settings().get("update_channel", "release"),
                      auto_update=config.settings().get("auto_update", True))
-try:
-    from fourier_analyzer.synth.wavetables import StockIndex
-    if config.serum_tables_dir():
-        idx = StockIndex().build()
-        print("indexed", len(idx.ids), "stock wavetables")
-except Exception as e:
-    print("table index will be built on first use:", e)
 EOP
 ) || true
 if [ "${CHANNEL#branch:}" != "$CHANNEL" ]; then

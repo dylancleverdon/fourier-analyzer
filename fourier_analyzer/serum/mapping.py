@@ -40,6 +40,9 @@ SCALES = {
 FILTER_NAMES = {"lp12": "L12", "lp24": "L24", "hp12": "H12", "hp24": "H24", "bp12": "BP12"}
 DIST_NAMES = {"soft": "kSoftClip", "hard": "kHardClip", "tube": None, "sinefold": "kSinFold",
               "linfold": "kLinFold", "diode": "kDiode1"}
+# Serum 2 WT warp menu values (osc A: "_OSC" = from osc B)
+WARP_NAMES = {"fm_b": "kFM_OSC", "fm_sub": "kFM_SUB", "am_b": "kAM_OSC", "rm_b": "kRM_OSC",
+              "rm_sub": "kRM_SUB"}
 SUB_NAMES = {"sine": None, "triangle": "kTriangle", "saw": "kSaw", "square": "kSquare"}
 
 # modulation source ids (ModSlot "source": [id, 0])
@@ -145,6 +148,13 @@ def patch_to_state(patch: Patch, bank: TableBank | None = None) -> dict:
         wpp = _pp(wt)
         wpp["kParamTablePos"] = float(sc["tablepos_lo"] + o.position * (sc["tablepos_hi"] - sc["tablepos_lo"]))
         wpp["kParamRandomPhase"] = float(o.random_phase * 100)
+        if o.phase:
+            wpp["kParamInitialPhase"] = float((o.phase % 1.0) * 360)
+        modulator_on = (patch.sub.enabled if o.warp.endswith("_sub")
+                        else patch.oscs[1 if i != 1 else 0].enabled)
+        if o.warp != "none" and o.warp_amount > 0 and modulator_on:
+            wpp["kParamWarpMenu"] = WARP_NAMES[o.warp]
+            wpp["kParamWarp"] = float(np.clip(o.warp_amount, 0, 1))
         ref = resolve_serum_ref(o.table)
         if ref:
             wt["relativePathToWT"] = ref

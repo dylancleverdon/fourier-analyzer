@@ -20,13 +20,15 @@ N_HARM_FEAT = 64          # harmonics used for table matching
 N_MIP = 11                # mip level l keeps harmonics <= 1024 >> l
 
 
-def _from_harmonics(mags, phases=None) -> np.ndarray:
+def _from_harmonics(mags, phases=None, normalize: bool = True) -> np.ndarray:
     spec = np.zeros(FRAME // 2 + 1, dtype=np.complex128)
     mags = np.asarray(mags, dtype=float)
     n = min(len(mags), FRAME // 2)
     ph = np.zeros(n) if phases is None else np.asarray(phases[:n], dtype=float)
     spec[1:n + 1] = mags[:n] * np.exp(1j * ph)
     w = np.fft.irfft(spec, FRAME)
+    if not normalize:
+        return w.astype(np.float32)
     peak = np.max(np.abs(w))
     return (w / peak if peak > 0 else w).astype(np.float32)
 
@@ -268,8 +270,10 @@ def custom_table_from_harmonics(frames_mag: np.ndarray, frames_phase: np.ndarray
         ph = None if frames_phase is None else frames_phase[i]
         if ph is None:
             ph = np.full(len(m), -np.pi / 2)
-        out.append(_from_harmonics(m, ph))
-    return np.stack(out)
+        out.append(_from_harmonics(m, ph, normalize=False))
+    tab = np.stack(out)
+    peak = float(np.max(np.abs(tab)))      # one gain for the whole table
+    return (tab / peak if peak > 0 else tab).astype(np.float32)
 
 
 def resolve_serum_ref(table_id: str) -> str | None:

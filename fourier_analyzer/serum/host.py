@@ -145,7 +145,7 @@ class SerumHost:
         return y[: int(duration * self.sr)]
 
 
-def verify(preset: bytes, notes, y_target: np.ndarray, sr: int) -> dict:
+def verify(preset: bytes, notes, y_target: np.ndarray, sr: int, gain=None) -> dict:
     """Render the preset in real Serum and score it. Never raises."""
     try:
         host = SerumHost(sr=44100)
@@ -153,12 +153,11 @@ def verify(preset: bytes, notes, y_target: np.ndarray, sr: int) -> dict:
         y = host.render(notes, len(y_target) / sr)
         if not np.any(np.abs(y) > 1e-5):
             return {"ok": False, "error": "Serum rendered silence (preset not accepted?)"}
-        from ..audio import resample
-        from ..match.score import Target
-        yt = resample(y_target, sr, 22050)
-        yr = resample(y, 44100, 22050)
-        s, d = Target(yt, 22050).score(yr, detail=True)
-        return {"ok": True, "score": round(float(s), 2), "details": d, "audio": y}
+        from ..match.metrics import Reference
+        if gain is not None:
+            y = y[: len(gain)] * gain[: len(y)]
+        d = Reference(np.asarray(y_target, dtype=np.float64), sr).all(y)
+        return {"ok": True, "score": d["waveform_similarity"], "details": d, "audio": y}
     except Exception as e:
         log.warning("Serum verification unavailable: %s", e)
         return {"ok": False, "error": str(e)}

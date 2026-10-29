@@ -49,9 +49,19 @@ async function loadProjects() {
   const ul = $("#projects"); ul.innerHTML = "";
   list.forEach((p) => {
     const li = document.createElement("li");
-    li.textContent = p.name; li.title = p.id;
+    li.title = p.id;
+    li.innerHTML = `<span class="pname"></span><button class="del" title="Delete project">×</button>`;
+    li.querySelector(".pname").textContent = p.name;
     if (p.id === state.pid) li.classList.add("active");
     li.onclick = () => openProject(p.id);
+    li.querySelector(".del").onclick = async (e) => {
+      e.stopPropagation();
+      if (!confirm(`Delete project "${p.name}" and all its stems and results?\n(Files already exported to ~/Music/Fourier Analyzer are kept.)`)) return;
+      const r = await fetch(`/api/projects/${p.id}`, { method: "DELETE" });
+      if (!r.ok) { alert(await r.text()); return; }
+      if (state.pid === p.id) { state.pid = null; state.stem = null; $("#proj").hidden = true; $("#empty").hidden = false; }
+      loadProjects();
+    };
     ul.appendChild(li);
   });
 }
@@ -62,8 +72,9 @@ async function upload(file) {
   const r = await fetch(`/api/projects?drums=${$("#optDrums").checked}`, { method: "POST", body: fd });
   if (!r.ok) { alert("Upload failed: " + (await r.text())); return; }
   const j = await r.json();
+  $("#jobBox").hidden = true;
   await openProject(j.project.id);
-  pollJob(j.job, () => openProject(j.project.id));
+  if (j.job) pollJob(j.job, () => openProject(j.project.id));
   loadProjects();
 }
 
@@ -88,7 +99,11 @@ async function openProject(pid) {
     const r = await post(`/api/projects/${pid}/separate`);
     pollJob(r.job, () => openProject(pid));
   };
+  const fresh = state.meta.status === "new";
+  $("#clipCard").hidden = !fresh;
+  $("#instCard").hidden = fresh;
   renderInstruments(); renderStems(); renderPastResults();
+  if (fresh && state.stem !== "mix") selectStem("mix");
   document.querySelectorAll("#projects li").forEach((li) => li.classList.toggle("active", li.title === pid));
 }
 
@@ -115,7 +130,7 @@ function renderStems() {
   Object.keys(state.meta.stems).forEach((name) => {
     const row = document.createElement("div");
     row.className = "stem" + (name === state.stem ? " active" : "");
-    row.innerHTML = `<button class="iconbtn" title="Play">▶</button>
+    row.innerHTML = `<label class="tick" title="Tick to combine"><input type="checkbox" data-stem="${name}"></label><button class="iconbtn" title="Play">▶</button>
       <div><div class="name">${name}<small>${name === "mix" ? "full mix" : stemLabel(name)}</small></div><canvas></canvas></div>
       <div class="acts"><button class="ghost sel">Select</button><a class="btn ghost" href="/api/projects/${state.pid}/audio/${name}" download="${name}.wav">.wav</a></div>`;
     row.querySelector(".iconbtn").onclick = (e) => { e.stopPropagation(); playStem(name); };
@@ -342,11 +357,46 @@ function showAnalysis(a) {
   const l = a.lfo;
   kv($("#lfoInfo"), l ? [["moves", l.feature], ["rate", l.sync ? `${l.sync} @ ${a.bpm} BPM` : fmt(l.rate_hz, 2) + " Hz"], ["period", fmt(l.period_s * 1000, 0) + " ms"], ["strength", fmt(l.strength, 2)], ["retrigger", l.mode]] : [["none detected", ""]]);
   kv($("#charInfo"), [["type", a.percussive ? "percussive / drum" : "pitched"], ["voiced", fmt(a.voiced_ratio * 100, 0) + " %"], ["noise", fmt(a.noise_ratio * 100, 0) + " %"], ["unison/detune", fmt(a.unison_hint, 2)], ["tempo", a.bpm + " BPM"]]);
+  const sc = a.sidechain || {};
+  $("#scAnalysis").innerHTML = sc.detected
+    ? `<b>Detected</b> from the ${sc.source}: −${sc.depth_db} dB duck, attack ${sc.attack_ms} ms, hold ${sc.hold_ms} ms, release ${sc.release_ms} ms (${sc.kicks_used} kicks, fit error ${sc.fit_rms_db} dB). The analysis above is of the <i>un-ducked</i> synth.<br><span class="muted">${sc.logic || ""}</span>`
+    : `<span class="muted">Not detected: ${sc.reason || "—"}</span>`;
+  drawRoll(a, sc);
   const tb = $("#notesBody"); tb.innerHTML = "";
   a.notes.forEach((n, i) => {
     const g = (a.timing.notes || [])[i] || {};
     const bend = n.bend ? `${fmt(Math.min(...n.bend.map((b) => b[1])), 1)} … ${fmt(Math.max(...n.bend.map((b) => b[1])), 1)} st` : "";
     tb.insertAdjacentHTML("beforeend", `<tr><td>${i + 1}</td><td class="mono">${fmt(n.start, 4)}</td><td class="mono">${fmt(g.grid_16th, 3)}</td><td class="mono">${fmt(g.offset_ms, 1)} ms</td><td>${fmt(g.length_16ths, 2)} × 1/16</td><td>${noteName(n.pitch)}</td><td>${bend}</td></tr>`);
+  });
+}
+
+function drawRoll(a, sc) {
+  const cv = $("#roll"), dpr = window.devicePixelRatio || 1, w = cv.clientWidth, h = cv.clientHeight;
+  cv.width = w * dpr; cv.height = h * dpr;
+  const g = cv.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, w, h);
+  const notes = a.notes || [];
+  if (!notes.length) return;
+  let lo = Math.min(...notes.map((n) => n.pitch + Math.min(0, ...(n.bend || [[0, 0]]).map((b) => b[1])))) - 2;
+  let hi = Math.max(...notes.map((n) => n.pitch + Math.max(0, ...(n.bend || [[0, 0]]).map((b) => b[1])))) + 2;
+  if (hi - lo < 12) { const m = (hi + lo) / 2; lo = m - 6; hi = m + 6; }
+  const dur = a.duration, pad = 34;
+  const X = (t) => pad + (t / dur) * (w - pad - 4), Y = (p) => 6 + (1 - (p - lo) / (hi - lo)) * (h - 12);
+  g.font = "10px -apple-system"; g.fillStyle = "#8a92a6"; g.strokeStyle = "#20242d";
+  for (let p = Math.ceil(lo); p <= hi; p++) {
+    if (p % 12 === 0 || hi - lo < 25) { g.beginPath(); g.moveTo(pad, Y(p)); g.lineTo(w, Y(p)); g.stroke(); }
+    if (p % 12 === 0) g.fillText(noteName(p), 2, Y(p) + 3);
+  }
+  const beat = 60 / a.bpm;
+  for (let t = 0, k = 0; t < dur; t += beat, k++) { g.strokeStyle = k % 4 === 0 ? "#2f3542" : "#1b1f27"; g.beginPath(); g.moveTo(X(t), 0); g.lineTo(X(t), h); g.stroke(); }
+  (sc && sc.kicks || []).forEach((k) => { g.fillStyle = "#ff8a3d"; g.fillRect(X(k) - 1, h - 8, 2, 8); });
+  notes.forEach((n) => {
+    g.fillStyle = `rgba(176,108,255,${0.35 + 0.65 * (n.velocity || 1)})`;
+    g.fillRect(X(n.start), Y(n.pitch) - 4, Math.max(2, X(n.start + n.duration) - X(n.start)), 8);
+    if (n.bend) {
+      g.strokeStyle = "#ffffff"; g.lineWidth = 1.2; g.beginPath();
+      n.bend.forEach((b, i) => { const x = X(n.start + b[0]), y = Y(n.pitch + b[1]); i ? g.lineTo(x, y) : g.moveTo(x, y); });
+      g.stroke(); g.lineWidth = 1;
+    }
   });
 }
 
@@ -356,7 +406,7 @@ $("#runRecon").onclick = async () => {
   const body = {
     stem: state.stem, ...selRange(), bpm: parseFloat($("#bpm").value) || null,
     target: parseFloat($("#target").value), time_budget: parseFloat($("#budget").value),
-    allow_custom: $("#allowCustom").checked, stock_only: $("#stockOnly").checked, verify_serum: $("#verifySerum").checked,
+    verify_serum: $("#verifySerum").checked,
   };
   if (!body.start && state.duration > 12 && !confirm("No selection: the whole stem will be used (only the first 6 s drive the search). Continue?")) return;
   $("#runRecon").disabled = true;
@@ -371,11 +421,27 @@ function showResult(r) {
   $("#accVal").textContent = fmt(r.accuracy, 1);
   const badge = $("#accBadge");
   badge.className = "badge " + (r.met_target ? "ok" : "warn");
-  badge.textContent = r.met_target ? `target ${r.target}% reached${r.used_custom_wavetable ? " (custom wavetable)" : " with stock/basic waves"}` : `below target ${r.target}% — try a longer search or allow custom wavetables`;
+  badge.textContent = r.met_target ? `target ${r.target}% reached` : `below target ${r.target}%: try a longer search or a cleaner selection`;
   const d = r.details;
-  $("#accBars").innerHTML = ["spectral", "harmonic", "envelope", "tone", "movement"].map((k) => `<span>${k}</span><div class="b"><div style="width:${d[k]}%"></div></div><span>${fmt(d[k], 0)}</span>`).join("") +
-    `<span>raw</span><span class="muted small">${fmt(d.raw_score, 1)} raw ÷ ${fmt(d.self_similarity, 1)} phase-noise ceiling</span><span></span>`;
-  $("#serumScore").textContent = r.serum && r.serum.ok ? `Real Serum 2 render scored ${fmt(r.serum.score, 1)} (raw)` : `Serum 2 check: ${r.serum ? r.serum.error : "not run"}`;
+  const info = r.metric_info || {};
+  if ("waveform_similarity" in d) {
+    const rows = [
+      ["waveform similarity", d.waveform_similarity, "%", d.waveform_similarity],
+      ["spectral similarity", d.spectral_similarity, "%", d.spectral_similarity],
+      ["envelope correlation", d.envelope_correlation, "%", d.envelope_correlation],
+      ["SI-SDR", d.si_sdr_db, " dB", Math.max(0, Math.min(100, d.si_sdr_db * 5))],
+      ["log-spectral distance", d.lsd_db, " dB", Math.max(0, 100 - d.lsd_db * 10)],
+    ];
+    const keys = ["waveform_similarity", "spectral_similarity", "envelope_correlation", "si_sdr_db", "lsd_db"];
+    $("#accBars").innerHTML = rows.map((x, i) => `<span title="${info[keys[i]] || ""}">${x[0]}</span><div class="b"><div style="width:${x[3]}%"></div></div><span>${fmt(x[1], 1)}${x[2]}</span>`).join("");
+  } else {   // results made by older versions
+    $("#accBars").innerHTML = ["spectral", "harmonic", "envelope", "tone", "movement"].map((k) => `<span>${k}</span><div class="b"><div style="width:${d[k]}%"></div></div><span>${fmt(d[k], 0)}</span>`).join("");
+  }
+  const sc = r.sidechain;
+  $("#scInfo").textContent = !sc ? "" : sc.detected
+    ? `Sidechain detected from the ${sc.source}: -${sc.depth_db} dB duck, attack ${sc.attack_ms} ms, hold ${sc.hold_ms} ms, release ${sc.release_ms} ms (${sc.kicks_used} kicks). It was removed before fitting and is re-applied when comparing. ${r.sidechain_logic || ""}`
+    : `No sidechain ducking found (${sc.reason || ""}).`;
+  $("#serumScore").textContent = r.serum && r.serum.ok ? `Real Serum 2 render: waveform similarity ${fmt(r.serum.score, 1)}%, spectral ${fmt(r.serum.details.spectral_similarity, 1)}%` : `Serum 2 check: ${r.serum ? r.serum.error : "not run"}`;
   const base = `/api/projects/${state.pid}/results/${r.id}/file/`;
   $("#aTarget").src = base + "target.wav";
   $("#aRender").src = base + "render.wav";
@@ -468,6 +534,41 @@ function renderBpmAlts() {
     box.appendChild(b);
   });
 }
+// ------------------------------------------------------------------ clip + combine
+async function separate(clip) {
+  const r = selRange();
+  // clip=false still sends clip:true with no range: that restores the full original
+  const body = { drums: $("#optDrums").checked, clip: true, start: clip ? r.start : null, end: clip ? r.end : null };
+  if (clip && r.start == null) { alert("Drag over the part you want in the waveform first (or use 'Separate whole file')."); return; }
+  $("#clipCard").hidden = true;
+  state.sel = null;
+  const j = await post(`/api/projects/${state.pid}/separate`, body);
+  state.meta.status = "separating";
+  pollJob(j.job, () => { state.stem = null; openProject(state.pid); });
+}
+$("#sepSelBtn").onclick = () => separate(true);
+$("#sepAllBtn").onclick = () => {
+  const m = state.meta.clip ? "This re-separates the WHOLE original file. Continue?" : null;
+  if (m && !confirm(m)) return;
+  separate(false);
+};
+$("#reclipBtn").onclick = async () => {
+  if (!confirm("Pick a new region of the ORIGINAL file and separate it again? Current stems are replaced (finished reconstructions are kept).")) return;
+  await post(`/api/projects/${state.pid}/clip`, {});
+  state.stem = null;
+  await openProject(state.pid);
+};
+$("#combineBtn").onclick = async () => {
+  const picked = [...document.querySelectorAll('#stems input[type=checkbox]:checked')].map((c) => c.dataset.stem);
+  if (picked.length < 2) { alert("Tick two or more stems/layers to combine (e.g. bass_layer1 + bass_layer3)."); return; }
+  const name = prompt("Name for the combined stem:", picked.join("+"));
+  if (name === null) return;
+  try {
+    const r = await post(`/api/projects/${state.pid}/combine`, { stems: picked, name });
+    await openProject(state.pid);
+    selectStem(r.stem);
+  } catch (e) { alert(e.message); }
+};
 $("#bpm").onchange = () => {
   const v = parseFloat($("#bpm").value);
   if (v > 0 && state.pid) { post(`/api/projects/${state.pid}/bpm`, { bpm: v }); state.meta.bpm = v; }

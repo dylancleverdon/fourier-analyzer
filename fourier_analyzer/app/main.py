@@ -57,12 +57,40 @@ def _ensure_path():
         logging.warning("ffmpeg not found; mp3/m4a input may fail")
 
 
+REQUIRED_IMPORTS = ("onnxruntime", "audioread", "audio_separator.separator", "pedalboard", "cma",
+                    "zstandard", "cbor2", "librosa", "soundfile", "mido", "imageio_ffmpeg")
+
+
+def _ensure_dependencies():
+    """Self-heal: if any runtime module is missing, install requirements.txt
+    into the app's venv (covers installs made before a dependency was added)."""
+    import importlib
+    missing = []
+    for mod in REQUIRED_IMPORTS:
+        try:
+            importlib.import_module(mod)
+        except Exception as e:      # ImportError, or a broken native build
+            missing.append(f"{mod} ({type(e).__name__})")
+    if not missing:
+        return
+    req = config.code_dir() / "requirements.txt"
+    logging.warning("missing modules %s; installing %s", ", ".join(missing), req)
+    try:
+        updater._pip_install(req, log_cb=logging.info)
+        importlib.invalidate_caches()
+    except Exception:
+        logging.exception("automatic dependency install failed")
+
+
 def run(open_window: bool = True, port: int | None = None):
     logfile = config.app_dir() / "app.log"
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s",
                         handlers=[logging.FileHandler(logfile), logging.StreamHandler()])
     _ensure_path()
     _auto_update()
+    import os
+    if "--no-dep-check" not in sys.argv and not os.environ.get("FA_NO_DEP_CHECK"):
+        _ensure_dependencies()
     import uvicorn
     from .server import app
     port = port or _free_port()

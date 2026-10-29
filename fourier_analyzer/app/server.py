@@ -109,7 +109,7 @@ def projects():
 
 
 @app.post("/api/projects")
-async def upload(file: UploadFile = File(...), drums: bool = True):
+async def upload(file: UploadFile = File(...), drums: bool = True, separate: bool = False):
     suffix = Path(file.filename or "audio.wav").suffix or ".wav"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(await file.read())
@@ -118,8 +118,9 @@ async def upload(file: UploadFile = File(...), drums: bool = True):
         meta = project.create_project(tmp_path, file.filename or "audio")
     finally:
         tmp_path.unlink(missing_ok=True)
-    job = project.start_separation(meta["id"], drums=drums)
-    return {"project": meta, "job": job.id}
+    # by default the user first clips the region they want, then separates
+    job = project.start_separation(meta["id"], drums=drums) if separate else None
+    return {"project": meta, "job": job.id if job else None}
 
 
 @app.get("/api/projects/{pid}")
@@ -130,9 +131,59 @@ def get_project(pid: str):
         raise HTTPException(404, "no such project")
 
 
+class SeparateIn(BaseModel):
+    start: float | None = None
+    end: float | None = None
+    drums: bool = True
+    clip: bool = False          # true: cut the mix to start/end of the original first
+
+
+@app.delete("/api/projects/{pid}")
+def delete_project(pid: str):
+    try:
+        project.delete_project(pid)
+    except FileNotFoundError:
+        raise HTTPException(404, "no such project")
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+    return {"deleted": pid}
+
+
 @app.post("/api/projects/{pid}/separate")
-def reseparate(pid: str):
-    return {"job": project.start_separation(pid).id}
+def reseparate(pid: str, body: SeparateIn | None = None):
+    body = body or SeparateIn()
+    clip = (body.start, body.end) if body.clip else None
+    return {"job": project.start_separation(pid, drums=body.drums, clip=clip).id}
+
+
+class ClipIn(BaseModel):
+    start: float | None = None
+    end: float | None = None
+
+
+@app.post("/api/projects/{pid}/clip")
+def clip(pid: str, body: ClipIn):
+    """Without start/end: restore the full original so a new region can be picked."""
+    try:
+        meta = project.clip_mix(pid, body.start, body.end)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    meta["status"] = "new"
+    project.save_meta(pid, meta)
+    return meta
+
+
+class CombineIn(BaseModel):
+    stems: list[str]
+    name: str | None = None
+
+
+@app.post("/api/projects/{pid}/combine")
+def combine(pid: str, body: CombineIn):
+    try:
+        return {"stem": project.combine_stems(pid, body.stems, body.name)}
+    except (ValueError, KeyError) as e:
+        raise HTTPException(400, str(e))
 
 
 def _stem_path(pid: str, stem: str) -> Path:
@@ -214,8 +265,6 @@ class RegionIn(BaseModel):
     end: float | None = None
     bpm: float | None = None
     target: float = 90.0
-    allow_custom: bool = True
-    stock_only: bool = False
     time_budget: float = 240.0
     verify_serum: bool = True
 

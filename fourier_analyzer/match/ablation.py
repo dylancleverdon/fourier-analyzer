@@ -49,10 +49,24 @@ def _energy(y):
 
 
 def run_checks(patch: Patch, y_target: np.ndarray, sr: int, notes, f0: np.ndarray,
-               renderer: Renderer, target: Target | None = None) -> list[dict]:
-    """``f0`` must be on the same hop (256) as y_target at ``sr``."""
+               renderer: Renderer, target: Target | None = None, gain=None) -> list[dict]:
+    """``f0`` must be on the same hop (256) as y_target at ``sr``. ``gain`` is
+    the measured sidechain gain applied to every render (DAW context)."""
     dur = len(y_target) / sr
     target = target or Target(y_target, sr)
+    _render = renderer.render
+
+    class _R:
+        sr = renderer.sr
+
+        @staticmethod
+        def render(p, nts, d, solo=None):
+            out = _render(p, nts, d, solo=solo)
+            if gain is not None:
+                g = gain[: len(out)]
+                out = out[: len(g)] * g
+            return out
+    renderer = _R
     full = renderer.render(patch, notes, dur)
     base = target.score(full)
     checks = []

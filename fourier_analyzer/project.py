@@ -124,11 +124,21 @@ def list_projects() -> list[dict]:
     return out
 
 
+def delete_project(pid: str) -> None:
+    d = project_dir(pid)
+    if any(j.project == pid and j.status in ("queued", "running") for j in JOBS.jobs.values()):
+        raise RuntimeError("a job is still running for this project")
+    if d.resolve().parent != config.projects_dir().resolve():
+        raise RuntimeError("refusing to delete outside the projects folder")
+    shutil.rmtree(d)
+
+
 def create_project(upload_path: Path, original_name: str) -> dict:
     pid = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:4]
     d = config.projects_dir() / pid
     (d / "stems").mkdir(parents=True)
     y, sr = audio.load(upload_path, sr=44100, mono=False)
+    audio.save(d / "original.wav", y, sr)      # untouched copy; mix.wav may be clipped
     audio.save(d / "mix.wav", y, sr)
     meta = {"id": pid, "name": Path(original_name).stem, "created": time.time(), "status": "new",
             "duration": round(y.shape[-1] / sr, 3), "stems": {"mix": "mix.wav"}, "instruments": [],
@@ -137,12 +147,64 @@ def create_project(upload_path: Path, original_name: str) -> dict:
     return meta
 
 
-def start_separation(pid: str, drums: bool = True) -> Job:
+def clip_mix(pid: str, start: float | None, end: float | None) -> dict:
+    """Cut mix.wav down to [start, end] of the original upload (None = full)."""
+    d = project_dir(pid)
+    meta = load_meta(pid)
+    src = d / "original.wav" if (d / "original.wav").exists() else d / "mix.wav"
+    y, sr = audio.load(src, sr=44100, mono=False)
+    if start is not None or end is not None:
+        a = int(max(0.0, start or 0.0) * sr)
+        b = int(min(y.shape[-1] / sr, end or y.shape[-1] / sr) * sr)
+        if b - a < sr // 4:
+            raise ValueError("clip must be at least 0.25 s long")
+        y = y[..., a:b]
+        meta["clip"] = [round(a / sr, 4), round(b / sr, 4)]
+    else:
+        meta.pop("clip", None)
+    audio.save(d / "mix.wav", y, sr)
+    meta["duration"] = round(y.shape[-1] / sr, 3)
+    meta["stems"] = {"mix": "mix.wav"}
+    meta["instruments"] = []
+    save_meta(pid, meta)
+    return meta
+
+
+def combine_stems(pid: str, names: list[str], new_name: str | None = None) -> str:
+    """Sum several stems/layers into a new stem."""
+    d = project_dir(pid)
+    meta = load_meta(pid)
+    if len(names) < 2:
+        raise ValueError("pick at least two stems to combine")
+    parts = [audio.load(d / meta["stems"][n], sr=44100, mono=False)[0] for n in names]
+    n = max(p.shape[-1] for p in parts)
+    ch = max(p.shape[0] if p.ndim == 2 else 1 for p in parts)
+    out = np.zeros((ch, n), dtype=np.float32)
+    for p in parts:
+        p = np.atleast_2d(p)
+        out[:, : p.shape[-1]] += p if p.shape[0] == ch else np.repeat(p[:1], ch, axis=0)
+    base = new_name or "+".join(names)
+    key = "".join(c if c.isalnum() or c in "_+-" else "_" for c in base)[:60]
+    while key in meta["stems"]:
+        key += "_2"
+    path = audio.save(d / "stems" / "combined" / f"{key}.wav", out, 44100)
+    meta["stems"][key] = str(path.relative_to(d))
+    from .analysis.instruments import describe_all
+    meta["instruments"] += describe_all({key: path}, d / "mix.wav")
+    save_meta(pid, meta)
+    return key
+
+
+def start_separation(pid: str, drums: bool = True, clip: tuple | None = None) -> Job:
     def work(job: Job):
         from .analysis.features import tempo_candidates
         from .analysis.instruments import describe_all
         from .separation.stems import separate_all
         d = project_dir(pid)
+        if clip is not None:
+            job.set("clip", "Clipping the audio to your selection")
+            clip_mix(pid, *clip)
+            job.msg(f"clipped to {clip[0] or 0:.2f}-{clip[1] or 0:.2f} s of the original")
         meta = load_meta(pid)
         meta["status"] = "separating"
         save_meta(pid, meta)
@@ -226,6 +288,19 @@ def load_segment(pid: str, stem: str, start: float | None, end: float | None, sr
     return y[a:b], sr
 
 
+def detect_sidechain(pid: str, y: np.ndarray, sr: int, notes, start, end, bpm) -> dict:
+    """Kick times from the kick stem (or the beat grid) + ducking model."""
+    from .analysis import sidechain as SC
+    meta = load_meta(pid)
+    if "drum_kick" in meta["stems"]:
+        yk, _ = load_segment(pid, "drum_kick", start, end, sr=sr)
+        kicks, src = SC.kick_times_from_audio(yk, sr), "kick stem"
+    else:
+        ym, _ = load_segment(pid, "mix", start, end, sr=sr)
+        kicks, src = SC.kick_times_from_grid(ym, sr, bpm or 140.0), "beat grid"
+    return SC.estimate(y, sr, notes, kicks, source=src)
+
+
 def quick_analysis(pid: str, stem: str, start, end, bpm=None) -> dict:
     """Fourier analysis for the UI (no optimisation)."""
     from .analysis.features import analyze
@@ -233,8 +308,15 @@ def quick_analysis(pid: str, stem: str, start, end, bpm=None) -> dict:
     y, sr = load_segment(pid, stem, start, end, sr=22050)
     if len(y) < 2048:
         raise ValueError("selection too short")
-    a = analyze(y, sr, bpm=bpm or meta.get("bpm"))
+    bpm = bpm or meta.get("bpm")
+    a = analyze(y, sr, bpm=bpm)
+    sc = detect_sidechain(pid, y, sr, a.notes, start, end, bpm)
+    if sc["detected"]:
+        from .analysis.sidechain import gain_curve, logic_settings
+        a = analyze(y / np.maximum(gain_curve(sc, len(y), sr), 0.1), sr, bpm=bpm)
+        sc["logic"] = logic_settings(sc)
     s = a.summary()
+    s["sidechain"] = sc
     hz = a.spectrum_hz
     keep = (hz >= 20) & (hz <= 11000)
     idx = np.unique(np.geomspace(1, keep.sum() - 1, 400).astype(int))
@@ -250,11 +332,13 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict) -> Job:
         from .analysis.features import analyze
         from .export import write_midi, write_report
         from .match.ablation import run_checks
+        from .match.metrics import METRIC_INFO
         from .match.optimizer import OPT_SR, Options, Optimizer
         from .serum import host as serum_host
         from .serum.mapping import build_preset_bytes
         from .synth.engine import Renderer
-        from .synth.wavetables import StockIndex, TableBank
+        from .analysis import sidechain as SC
+        from .synth.wavetables import TableBank
 
         meta = load_meta(pid)
         bpm = opts.get("bpm") or meta.get("bpm") or 140.0
@@ -265,17 +349,22 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict) -> Job:
         job.set("analysis", "Fourier analysis of the selection (pitch, notes, harmonics, LFO)")
         job.msg("Fourier analysis of the selection")
         a = analyze(y22, OPT_SR, bpm=bpm)
+        # --- sidechain: kick times from the kick stem (or the beat grid) ---
+        job.set("sidechain", "Looking for sidechain ducking from the kick")
+        sc = detect_sidechain(pid, y22, OPT_SR, a.notes, start, end, bpm)
+        src = sc["source"]
+        gain22 = None
+        if sc["detected"]:
+            gain22 = SC.gain_curve(sc, len(y22), OPT_SR)
+            job.msg(f"sidechain detected ({src}): -{sc['depth_db']} dB, attack {sc['attack_ms']} ms, "
+                    f"hold {sc['hold_ms']} ms, release {sc['release_ms']} ms over {sc['kicks_used']} kicks; "
+                    f"removing it before fitting the patch")
+            a = analyze(y22 / np.maximum(gain22, 0.1), OPT_SR, bpm=bpm)   # analyse the un-ducked synth
+        else:
+            job.msg(f"no sidechain ducking found ({sc.get('reason', '')})")
         job.msg(f"{len(a.notes)} notes, voiced {a.voiced_ratio:.0%}, noise {a.noise_ratio:.0%}, "
                 f"LFO: {a.lfo['sync'] or a.lfo['rate_hz'] if a.lfo else 'none'}")
         bank = TableBank()
-        stock = None
-        if config.serum_tables_dir():
-            job.set("indexing", "Indexing your Serum 2 stock wavetables (cached after the first time)")
-            job.msg(f"indexing stock wavetables in {config.serum_tables_dir()}")
-            stock = StockIndex().build()
-            job.msg(f"{len(stock.ids)} stock tables indexed")
-        else:
-            job.msg("Serum tables folder not found: using built-in basic shapes only")
 
         def prog(stage, frac, best, text, status=None):
             job.stage, job.progress = stage, 0.05 + 0.85 * frac
@@ -285,16 +374,16 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict) -> Job:
             if text:
                 job.msg(text)
         o = Options(target_score=float(opts.get("target", 90)),
-                    allow_custom=bool(opts.get("allow_custom", True)),
-                    stock_only=bool(opts.get("stock_only", False)),
                     time_budget=float(opts.get("time_budget", 240)))
-        opt = Optimizer(y22, OPT_SR, a, o, bank=bank, stock=stock, progress=prog)
+        opt = Optimizer(y22, OPT_SR, a, o, bank=bank, progress=prog, context_gain=gain22)
         res = opt.run()
-        job.msg(f"accuracy {res.score:.1f} (raw {res.details['raw_score']}); running checks")
+        d = res.details
+        job.msg(f"waveform similarity {d['waveform_similarity']}%, spectral similarity "
+                f"{d['spectral_similarity']}%, SI-SDR {d['si_sdr_db']} dB; running checks")
         job.set("verification", "Verification: removing each component, noise attribution, timing and pitch checks")
         job.progress = 0.92
         checks = run_checks(res.patch, opt.y, OPT_SR, opt.notes, a.f0[: int(len(opt.y) / 256) + 1],
-                            opt.renderer, opt.target)
+                            opt.renderer, opt.target, gain=opt.gain)
 
         rid = time.strftime("%H%M%S-") + uuid.uuid4().hex[:4]
         out = project_dir(pid) / "results" / rid
@@ -307,6 +396,9 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict) -> Job:
         write_midi(out / "notes.mid", a.notes, bpm)
         r44 = Renderer(bank, 44100).render(res.patch, a.notes, len(y44) / 44100)
         audio.save(out / "render.wav", audio.normalize(r44), 44100)
+        gain44 = SC.gain_curve(sc, len(r44), 44100) if sc["detected"] else None
+        if gain44 is not None:
+            audio.save(out / "render_with_sidechain.wav", audio.normalize(r44 * gain44), 44100)
         audio.save(out / "target.wav", audio.normalize(y44), 44100)
         for tid, frames in bank.custom.items():
             from .synth.wavetables import write_serum_wav
@@ -317,7 +409,7 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict) -> Job:
             job.set("serum", "Rendering the preset in the real Serum 2 plugin")
             job.progress = 0.96
             job.msg("rendering in real Serum 2 for verification")
-            serum = serum_host.verify(preset, a.notes, y44, 44100)
+            serum = serum_host.verify(preset, a.notes, y44, 44100, gain=gain44)
             if serum.get("ok"):
                 audio.save(out / "serum_render.wav", audio.normalize(serum.pop("audio")), 44100)
                 job.msg(f"real Serum score: {serum['score']}")
@@ -325,8 +417,11 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict) -> Job:
                 job.msg(f"Serum verification unavailable: {serum.get('error')}")
         summary = {
             "id": rid, "stem": stem, "start": start, "end": end, "bpm": bpm, "name": name,
-            "accuracy": round(res.score, 2), "details": res.details, "target": o.target_score,
-            "met_target": res.score >= o.target_score, "used_custom_wavetable": res.used_custom,
+            "accuracy": round(res.score, 2), "metric": "waveform_similarity", "details": res.details,
+            "metric_info": METRIC_INFO, "target": o.target_score,
+            "met_target": res.score >= o.target_score, "used_custom_wavetable": True,
+            "sidechain": {k: v for k, v in sc.items() if k != "kicks"},
+            "sidechain_logic": SC.logic_settings(sc),
             "patch": res.patch.to_dict(), "description": res.patch.describe(), "stages": res.stages,
             "checks": checks, "serum": serum, "analysis": a.summary(), "evals": opt.evals,
             "files": sorted(p.name for p in out.iterdir()),

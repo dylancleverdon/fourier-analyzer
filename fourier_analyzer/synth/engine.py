@@ -15,6 +15,7 @@ from .patch import Env, Patch, Note, sync_to_hz
 from .wavetables import FRAME, TableBank
 
 CTRL = 64              # control-rate block size (samples)
+FM_INDEX = 1.5         # cycles of phase deviation at 100 % FM warp (calibratable)
 MAX_CUTOFF_FRAC = 0.45  # of sample rate
 
 try:                    # optional speed-up
@@ -399,19 +400,25 @@ class Renderer:
         rng = np.random.default_rng(self.seed)
         x = np.zeros(n)
         if solo in (None, "oscs"):
+            sub_sig = self._sub(patch, pitch) if patch.sub.enabled else None
+            raw = {}
+            # B and C first: they can be modulators for A's warp
+            for i in (1, 2, 0):
+                o = patch.oscs[i]
+                if not o.enabled:
+                    continue
+                mod_sig = None
+                if o.warp != "none" and o.warp_amount > 0:
+                    src = "sub" if o.warp.endswith("_sub") else ("b" if i != 1 else "a")
+                    mod_sig = sub_sig if src == "sub" else raw.get(1 if src == "b" else 0)
+                raw[i] = self._osc(o, pitch, dm.get(f"osc{i+1}.pos", 0.0), rng, tl, mod_sig)
             for i, o in patch.active_oscs():
                 lvl = np.clip(o.level + dm.get(f"osc{i+1}.level", 0.0), 0, 1.5)
-                if np.all(lvl == 0):
+                if np.all(lvl == 0) or i not in raw:
                     continue
-                x += lvl * self._osc(o, pitch, dm.get(f"osc{i+1}.pos", 0.0), rng)
-            if patch.sub.enabled:
-                s = patch.sub
-                tid = {"sine": "basic:sine", "triangle": "basic:triangle", "saw": "basic:saw",
-                       "square": "basic:square"}.get(s.shape, "basic:sine")
-                f = 440.0 * 2 ** ((pitch + 12 * s.octave - 69) / 12)
-                tab = self.bank.mip(tid, _mip_level(float(f.max()), sr))
-                ph = np.cumsum(f / sr)
-                x += s.level * _wt_lookup(tab, ph, np.zeros(1))
+                x += lvl * raw[i]
+            if patch.sub.enabled and sub_sig is not None and patch.sub.level > 0:
+                x += patch.sub.level * sub_sig
         if patch.noise.enabled and solo in (None, "noise"):
             nz = rng.standard_normal(n)
             c = patch.noise.color
@@ -433,7 +440,15 @@ class Renderer:
         amp = srcs["env1"] * tl.vel * np.clip(1.0 + dm.get("amp", 0.0), 0, 4)
         return x * amp
 
-    def _osc(self, o, pitch, posmod, rng):
+    def _sub(self, patch, pitch):
+        s = patch.sub
+        tid = {"sine": "basic:sine", "triangle": "basic:triangle", "saw": "basic:saw",
+               "square": "basic:square"}.get(s.shape, "basic:sine")
+        f = 440.0 * 2 ** ((pitch + 12 * s.octave - 69) / 12)
+        tab = self.bank.mip(tid, _mip_level(float(f.max()), self.sr))
+        return _wt_lookup(tab, np.cumsum(f / self.sr), np.zeros(1))
+
+    def _osc(self, o, pitch, posmod, rng, tl=None, mod_sig=None):
         sr = self.sr
         base = pitch + 12 * o.octave + o.semi + o.fine / 100.0
         offs, gains = unison_offsets(max(1, int(o.unison)), o.detune)
@@ -443,11 +458,28 @@ class Renderer:
         tab = self.bank.mip(o.table, _mip_level(f_max, sr))
         pos = np.clip(o.position + posmod, 0, 1) if np.ndim(posmod) else np.array([np.clip(o.position + posmod, 0, 1)])
         out = 0.0
+        starts = [b[0] for b in tl.bounds] if tl is not None else [0]
         for off, g in zip(offs, gains):
             f = 440.0 * 2 ** ((base + off - 69) / 12)
-            ph = np.cumsum(f / sr) + o.random_phase * rng.random()
+            ph = np.cumsum(f / sr)
+            # phase restarts at every note-on (Serum's default retrigger), at
+            # `phase` plus an optional random offset per note
+            offset = np.zeros(len(ph))
+            for k, s0 in enumerate(starts):
+                s1 = starts[k + 1] if k + 1 < len(starts) else len(ph)
+                base_ph = ph[s0 - 1] if s0 > 0 else 0.0
+                offset[s0:s1] = -base_ph + o.phase + o.random_phase * rng.random()
+            ph = ph + offset
+            if mod_sig is not None and o.warp.startswith("fm"):
+                # Serum-style FM = phase modulation by the modulator signal
+                ph = ph + o.warp_amount * FM_INDEX * mod_sig
             out = out + g * _wt_lookup(tab, ph, pos if pos.size > 1 else np.full(1, pos[0]))
-        return out / np.sqrt(np.sum(np.square(gains)))
+        out = out / np.sqrt(np.sum(np.square(gains)))
+        if mod_sig is not None and o.warp.startswith("am"):
+            out = out * ((1 - o.warp_amount) + o.warp_amount * (0.5 + 0.5 * mod_sig))
+        elif mod_sig is not None and o.warp.startswith("rm"):
+            out = out * ((1 - o.warp_amount) + o.warp_amount * mod_sig)
+        return out
 
     def _fx(self, patch: Patch, x):
         sr = self.sr

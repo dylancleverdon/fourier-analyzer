@@ -56,13 +56,28 @@
         <pre id="jobLog"></pre>
       </div>
 
-      <div class="card">
+      <div class="card" id="clipCard" hidden>
+        <h3>Step 1 · Clip before separating</h3>
+        <p class="muted small">Drag over the part of the song you want in the waveform below (e.g. the drop), then
+          separate just that. Separating less audio is faster and keeps the analysis focused.</p>
+        <div class="row">
+          <button id="sepSelBtn" class="primary">Separate selection</button>
+          <button id="sepAllBtn" class="ghost">Separate whole file</button>
+          <span id="clipInfo" class="muted small mono"></span>
+        </div>
+      </div>
+
+      <div class="card" id="instCard">
         <h3>Detected instruments</h3>
         <div id="instruments" class="chips"></div>
       </div>
 
-      <div class="card">
-        <h3>Stems</h3>
+      <div class="card" id="stemsCard">
+        <div class="ed-head"><h3>Stems</h3>
+          <div class="ed-tools">
+            <button id="combineBtn" class="ghost" title="Sum the ticked stems/layers into one new stem">Combine selected</button>
+            <button id="reclipBtn" class="ghost" title="Pick a different part of the original and separate again">Change clip…</button>
+          </div></div>
         <div id="stems" class="stems"></div>
       </div>
 
@@ -97,6 +112,10 @@
               <div><h4>Modulation (LFO)</h4><div id="lfoInfo" class="kv"></div></div>
               <div><h4>Character</h4><div id="charInfo" class="kv"></div></div>
             </div>
+            <h4>Sidechain</h4>
+            <div id="scAnalysis" class="small"></div>
+            <h4>Detected MIDI <span class="muted small">(pitch, timing, velocity, bends · orange ticks = kicks)</span></h4>
+            <canvas id="roll" height="200"></canvas>
             <h4>Notes &amp; timing</h4>
             <table class="notes"><thead><tr><th>#</th><th>start (s)</th><th>grid</th><th>offset</th><th>length</th><th>pitch</th><th>bend</th></tr></thead><tbody id="notesBody"></tbody></table>
           </div>
@@ -105,28 +124,27 @@
         <div class="tabpane" id="tab-recon" hidden>
           <div class="recon-opts">
             <div class="opt">
-              <label>Target accuracy <b id="targetVal">90</b>%</label>
+              <label>Stop early at waveform similarity <b id="targetVal">90</b>%</label>
               <input id="target" type="range" min="50" max="99" value="90">
-              <div class="muted small">Lower = simpler patch with basic/stock waves. Higher = may need custom wavetables.</div>
+              <div class="muted small">Always uses custom wavetables built from the sound. The search stops once the waveforms correlate this well (or the time runs out).</div>
             </div>
             <div class="opt">
               <label>Search time</label>
               <select id="budget"><option value="90">1.5 min</option><option value="240" selected>4 min</option><option value="480">8 min</option><option value="900">15 min</option></select>
             </div>
             <div class="opt checks">
-              <label class="check"><input id="allowCustom" type="checkbox" checked> allow custom wavetables if needed</label>
-              <label class="check"><input id="stockOnly" type="checkbox"> only Serum stock tables (no generated basics)</label>
               <label class="check"><input id="verifySerum" type="checkbox" checked> verify in real Serum 2</label>
             </div>
             <button id="runRecon" class="primary">Reconstruct</button>
           </div>
           <div id="result" hidden>
             <div class="score-row">
-              <div class="score"><div id="accVal" class="big">–</div><div class="muted">accuracy</div></div>
+              <div class="score"><div id="accVal" class="big">–</div><div class="muted">waveform similarity %</div></div>
               <div class="score-detail">
                 <div id="accBadge" class="badge"></div>
                 <div id="accBars" class="bars"></div>
                 <div id="serumScore" class="muted small"></div>
+                <div id="scInfo" class="muted small"></div>
               </div>
             </div>
             <div class="ab">

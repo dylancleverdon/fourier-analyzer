@@ -65,6 +65,8 @@ def continuous_params(p: Patch, focus: set[str] | None = None) -> list[Param]:
             if i > 0:
                 ps.append(Param(f"oscs.{i}.level", 0.02, 1.0))
                 ps.append(Param(f"oscs.{i}.fine", -50.0, 50.0))
+            if o.warp != "none":
+                ps.append(Param(f"oscs.{i}.warp_amount", 0.0, 1.0))
             if o.unison > 1:
                 ps.append(Param(f"oscs.{i}.detune", 0.01, 1.0))
                 ps.append(Param(f"oscs.{i}.blend", 0.0, 1.0))

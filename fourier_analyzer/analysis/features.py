@@ -148,7 +148,11 @@ def _frames_stft(y, sr):
     nfr = 1 + (len(yp) - N_FFT) // HOP
     idx = np.arange(N_FFT)[None, :] + HOP * np.arange(nfr)[:, None]
     win = np.hanning(N_FFT)
-    return np.fft.rfft(yp[idx] * win[None, :], axis=1)   # (frames, bins)
+    # zero-phase framing: rotate each frame so its centre is sample 0, so the
+    # phase of every bin is referenced to the frame centre (with a symmetric
+    # window this makes harmonic phases independent of bin mis-centring)
+    frames = np.fft.ifftshift(yp[idx] * win[None, :], axes=1)
+    return np.fft.rfft(frames, axis=1)   # (frames, bins)
 
 
 def _short_rms_db(y: np.ndarray, n_frames: int, win: int = 1024) -> np.ndarray:
@@ -288,14 +292,18 @@ def _segment_notes(y, sr, f0, conf, times, rms_db, percussive_hint):
         # pitch jump: >0.8 semitone change within two frames that persists
         # (ignored right after an attack, where drums/plucks sweep pitch)
         recent = bounds and (times[i] - times[bounds[-1]]) < 0.08
-        if not percussive_hint and not recent and i >= 3 and i + 3 < n:
-            before = midi[max(0, i - 3):i]
-            after = midi[i:i + 3]
-            if np.isfinite(before).sum() >= 2 and np.isfinite(after).sum() >= 2:
-                jump = np.nanmedian(after) - np.nanmedian(before)
-                step = abs(midi[i] - midi[i - 1]) if np.isfinite(midi[i]) and np.isfinite(midi[i - 1]) else 0
+        if not percussive_hint and not recent and i >= 6 and i + 5 < n:
+            # compare a steady window before with the window from i on; frames
+            # right at the transition may be unvoiced (clicks, retriggers)
+            before = midi[i - 6:i - 1]
+            after = midi[i:i + 5]
+            if np.isfinite(before).sum() >= 3 and np.isfinite(after).sum() >= 3:
+                mb = np.nanmedian(before)
+                jump = np.nanmedian(after) - mb
                 steady = np.nanmax(before) - np.nanmin(before) < 0.6   # slides are not steady
-                if abs(jump) > 0.8 and step > 0.5 and steady:
+                prev_ok = not np.isfinite(midi[i - 1]) or abs(midi[i - 1] - mb) < 0.5
+                cur_new = not np.isfinite(midi[i]) or abs(midi[i] - mb) > 0.5
+                if abs(jump) > 0.8 and steady and prev_ok and cur_new:
                     bounds.append(i)
     # merge boundaries closer than 40 ms
     merged = []
@@ -338,6 +346,47 @@ def _segment_notes(y, sr, f0, conf, times, rms_db, percussive_hint):
     if not notes:
         notes = [Note(0.0, dur_total, 48.0)]
     return notes
+
+
+def refine_pitches(y: np.ndarray, sr: int, notes) -> None:
+    """Sub-cent pitch per note: one long zero-padded FFT over the steady part
+    of each note (frequency resolution ~ 1/duration), quadratic peak
+    interpolation on the first harmonics, magnitude-weighted average of
+    f_k / k. Notes with pitch bends keep their tracked pitch."""
+    for n in notes:
+        if n.bend:
+            continue
+        a = int((n.start + min(0.03, n.duration * 0.2)) * sr)
+        b = int((n.start + n.duration) * sr)
+        seg = np.asarray(y[a:b], dtype=np.float64)
+        if len(seg) < 2048:
+            continue
+        nfft = 1 << int(np.ceil(np.log2(len(seg) * 8)))
+        S = np.abs(np.fft.rfft(seg * np.hanning(len(seg)), nfft))
+        binhz = sr / nfft
+        f0 = 440.0 * 2 ** ((n.pitch - 69) / 12)
+        est, wt = 0.0, 0.0
+        for k in range(1, 9):
+            fk = k * f0
+            if fk > sr / 2 * 0.9:
+                break
+            lo = int((fk * 2 ** (-0.4 / 12)) / binhz)
+            hi = int((fk * 2 ** (0.4 / 12)) / binhz) + 1
+            if hi - lo < 3:
+                continue
+            j = lo + int(np.argmax(S[lo:hi]))
+            if j <= 0 or j >= len(S) - 1:
+                continue
+            l0, l1, l2 = np.log(S[j - 1:j + 2] + 1e-20)
+            den = l0 - 2 * l1 + l2
+            d = 0.5 * (l0 - l2) / den if den != 0 else 0.0
+            est += (j + d) * binhz / k * S[j]
+            wt += S[j]
+        if wt > 0:
+            f = est / wt
+            new = 69 + 12 * np.log2(f / 440.0)
+            if abs(new - n.pitch) < 0.5:
+                n.pitch = round(float(new), 4)
 
 
 def _env_stats(y, sr, notes, rms_db, times):
@@ -506,6 +555,8 @@ def analyze(y: np.ndarray, sr: int, bpm: float | None = None) -> Analysis:
     # short, mostly unvoiced events behave like drums
     percussive_hint = voiced_ratio < 0.35
     notes = _segment_notes(y, sr, f0, vprob, times, rms_db, percussive_hint)
+    if not percussive_hint:
+        refine_pitches(y, sr, notes)
     # fill f0 gaps inside notes with the note pitch for harmonic analysis
     f0_filled = f0.copy()
     for nt in notes:

@@ -47,3 +47,16 @@ def test_apply_reinstalls_when_requirements_change(tmp_path, monkeypatch):
     monkeypatch.setattr(updater, "_pip_install", lambda req, log_cb=None: installs.append(req))
     updater.apply({"available": True, "url": "x", "latest": "0.2.0", "current": "0.1.1"})
     assert len(installs) == 1
+
+
+def test_missing_dependency_triggers_install(monkeypatch):
+    from fourier_analyzer.app import main
+    calls = []
+    monkeypatch.setattr(main, "REQUIRED_IMPORTS", ("json", "definitely_not_installed_xyz"))
+    monkeypatch.setattr(updater, "_pip_install", lambda req, log_cb=None: calls.append(req))
+    main._ensure_dependencies()
+    assert len(calls) == 1 and calls[0].name == "requirements.txt"
+    calls.clear()
+    monkeypatch.setattr(main, "REQUIRED_IMPORTS", ("json",))
+    main._ensure_dependencies()
+    assert not calls

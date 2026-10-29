@@ -1,18 +1,25 @@
-"""Analysis-by-synthesis patch reconstruction.
+"""Analysis-by-synthesis patch reconstruction (custom wavetables only).
 
-Strategy (simplest patch that reaches the target accuracy wins):
+1. Custom wavetables are built from the measured harmonic spectra of the
+   original (de-ducked if sidechain compression was detected):
+     - "single cycle": the median spectrum as one frame,
+     - "evolving": frames following the longest note through time (Env2
+       sweeps the table position),
+     - "LFO cycle": frames folded over one detected LFO period (the LFO
+       sweeps the position; how wub basses are built).
+   Each is tuned briefly and the best is kept.
+2. Structure search: try adding one component at a time (noise, unison,
+   sub, a second custom oscillator, LFO routings, filter, envelopes,
+   distortion, OTT, EQ, glide); keep a change only if it improves the fit.
+3. Pruning: remove each component in turn; drop it if the fit holds.
+4. Fine-tune every parameter with CMA-ES.
+5. Waveform stage: phase, fine tuning and attack are tuned to maximise the
+   literal waveform correlation with the original.
 
-1. Initial guess from Fourier analysis (pitch, envelope, cutoff, LFO, noise).
-2. Table search: basic shapes first, then the user's stock Serum tables,
-   each briefly tuned; keep the best few.
-3. Structure search: try adding one component at a time (noise, unison, sub,
-   2nd/3rd oscillator, LFO routings, filter envelope, distortion modes, OTT,
-   EQ, glide). Keep a change only if it improves the score.
-4. Pruning: remove each component in turn; if the score barely moves it
-   was not needed (keeps the patch honest and simple).
-5. Continuous fine-tune of every parameter with CMA-ES.
-6. Only if the target is still not met and custom tables are allowed:
-   build a wavetable from the measured harmonic spectra and re-tune.
+Renders are multiplied by the measured sidechain gain before comparison, so
+ducking that happens in the DAW is not mistaken for part of the patch.
+Search stages use a perceptual spectro-temporal objective (smooth, good for
+search); the reported result uses the objective metrics in metrics.py.
 """
 from __future__ import annotations
 
@@ -28,10 +35,9 @@ from ..analysis.features import Analysis
 from ..synth.engine import Renderer
 from ..synth.patch import (LFO, Distortion, EQ, Env, Filter, Mod, NoiseOsc, OTT, Osc, Patch,
                            SubOsc)
-from ..synth.wavetables import (BASIC_TABLES, N_HARM_FEAT, StockIndex, TableBank,
-                                custom_table_from_harmonics, harmonic_features,
-                                lowpass_fit_error)
+from ..synth.wavetables import StockIndex, TableBank, custom_table_from_harmonics
 from . import params as P
+from .metrics import Reference
 from .score import Target
 
 log = logging.getLogger(__name__)
@@ -39,11 +45,11 @@ log = logging.getLogger(__name__)
 OPT_SR = 22050
 STAGE_TEXT = {
     "init": "Initial guess from Fourier analysis",
-    "tables": "Wavetable search (basic shapes first, then Serum stock tables)",
+    "tables": "Building custom wavetables from the measured harmonics and picking the best",
     "structure": "Structure search: trying to add noise / unison / LFOs / FX one at a time",
     "prune": "Pruning: removing components that don't improve the match",
     "fine-tune": "Fine-tuning every parameter together (CMA-ES)",
-    "custom": "Custom wavetable from the measured harmonics",
+    "waveform": "Aligning phase and tuning to maximise waveform similarity",
     "final": "Final scoring",
 }
 MAX_OPT_SECONDS = 6.0
@@ -51,9 +57,7 @@ MAX_OPT_SECONDS = 6.0
 
 @dataclass
 class Options:
-    target_score: float = 90.0
-    allow_custom: bool = True          # allow generated wavetables
-    stock_only: bool = False           # forbid basic generated shapes too (use Serum files)
+    target_score: float = 90.0         # waveform similarity (%) that ends the search early
     time_budget: float = 240.0         # seconds
     max_oscs: int = 3
 
@@ -73,7 +77,8 @@ class Result:
 class Optimizer:
     def __init__(self, y: np.ndarray, sr: int, analysis: Analysis, options: Options | None = None,
                  bank: TableBank | None = None, stock: StockIndex | None = None,
-                 progress: Callable[[str, float, float, str], None] | None = None):
+                 progress: Callable[..., None] | None = None,
+                 context_gain: np.ndarray | None = None):
         self.opts = options or Options()
         self.analysis = analysis
         self.bank = bank or TableBank()
@@ -87,6 +92,12 @@ class Optimizer:
         self.y = y[:n]
         self.duration = n / OPT_SR
         self.target = Target(self.y, OPT_SR)
+        self.ref = Reference(self.y, OPT_SR)
+        if context_gain is not None:
+            g = np.asarray(context_gain, dtype=np.float64)[:n]
+            self.gain = np.pad(g, (0, n - len(g)), constant_values=1.0)
+        else:
+            self.gain = None
         self.renderer = Renderer(self.bank, OPT_SR)
         self.notes = [nt for nt in analysis.notes if nt.start < self.duration]
         self.t0 = time.time()
@@ -99,6 +110,8 @@ class Optimizer:
         self._last_beat = 0.0
         self.history: list = []
         self.stages: list = []
+        self.custom_ids: dict = {}
+        self.reserve = 0.0          # seconds kept back for later stages
 
     # ------------------------------------------------------------------
     def time_left(self) -> float:
@@ -131,58 +144,68 @@ class Optimizer:
         if msg:
             log.info("[%s] %.1f %s", stage, self.best_score, msg)
 
-    def evaluate(self, patch: Patch) -> float:
+    def render(self, patch: Patch) -> np.ndarray:
+        """Patch output as heard in the track (sidechain applied)."""
+        y = self.renderer.render(patch, self.notes, self.duration)
+        return y * self.gain if self.gain is not None else y
+
+    def evaluate(self, patch: Patch, objective: str = "search") -> float:
         self.evals += 1
         try:
-            y = self.renderer.render(patch, self.notes, self.duration)
+            y = self.render(patch)
         except Exception as e:      # a broken hypothesis should never kill the run
             log.debug("render failed: %s", e)
             return 0.0
         if not np.all(np.isfinite(y)):
             return 0.0
-        s = self.target.score(y)
-        if s > self.best_score:
-            self.best_score = s
+        if objective == "wave":
+            s = 0.7 * self.ref.waveform(y) + 0.3 * self.ref.spectral(y)
+        else:
+            # half perceptual (smooth landscape), half the reported spectral
+            # similarity, so the search improves the number the user sees
+            s = 0.5 * self.target.score(y) + 0.5 * self.ref.spectral(y)
+            if s > self.best_score:
+                self.best_score = s
         if time.time() - self._last_beat > 1.0:      # live heartbeat for the UI
             self.report(self.stage)
         return s
 
     # ------------------------------------------------------------------
     def tune(self, patch: Patch, evals: int, focus: set[str] | None = None,
-             sigma: float = 0.18) -> tuple[Patch, float]:
+             sigma: float = 0.18, objective: str = "search", params=None) -> tuple[Patch, float]:
         """CMA-ES over the continuous parameters (normalised to 0..1)."""
         import cma
-        ps = P.continuous_params(patch, focus)
-        base = self.evaluate(patch)
+        ps = params if params is not None else P.continuous_params(patch, focus)
+        base = self.evaluate(patch, objective)
         if not ps or evals <= 0:
             return patch, base
         x0 = P.vector(patch, ps)
         if len(ps) == 1:
-            return self._tune_1d(patch, ps, x0[0], base, evals)
+            return self._tune_1d(patch, ps, x0[0], base, evals, objective)
         popsize = max(6, min(14, 4 + int(3 * math.log(len(ps) + 1))))
         es = cma.CMAEvolutionStrategy(x0, sigma, {
             "bounds": [0.0, 1.0], "popsize": popsize, "maxfevals": evals,
             "verbose": -9, "seed": 1234, "tolfun": 1e-3})
         best_p, best_s = patch, base
-        while not es.stop() and self.time_left() > 0:
+        while not es.stop() and self.time_left() > self.reserve:
             xs = es.ask()
             fits = []
             for x in xs:
                 cand = P.apply(patch, ps, x)
-                s = self.evaluate(cand)
+                s = self.evaluate(cand, objective)
                 fits.append(-s)
                 if s > best_s:
                     best_p, best_s = cand, s
             es.tell(xs, fits)
         return best_p, best_s
 
-    def _tune_1d(self, patch, ps, u0, base, evals):
+    def _tune_1d(self, patch, ps, u0, base, evals, objective="search"):
         """Coarse grid then local refinement (CMA-ES needs >= 2 dimensions)."""
         best_p, best_s, best_u = patch, base, u0
         coarse = max(5, min(9, evals // 2))
         for u in np.linspace(0, 1, coarse):
             cand = P.apply(patch, ps, [u])
-            s = self.evaluate(cand)
+            s = self.evaluate(cand, objective)
             if s > best_s:
                 best_p, best_s, best_u = cand, s, u
         step = 0.5 / coarse
@@ -190,7 +213,7 @@ class Optimizer:
             for u in (best_u - step, best_u + step):
                 if 0 <= u <= 1:
                     cand = P.apply(patch, ps, [u])
-                    s = self.evaluate(cand)
+                    s = self.evaluate(cand, objective)
                     if s > best_s:
                         best_p, best_s, best_u = cand, s, u
             step *= 0.5
@@ -200,7 +223,7 @@ class Optimizer:
     def initial_patch(self) -> Patch:
         a = self.analysis
         p = Patch(name="Reconstructed", bpm=a.bpm)
-        p.oscs[0] = Osc(enabled=True, table="basic:saw", level=0.8)
+        p.oscs[0] = Osc(enabled=True, table="basic:saw", level=0.8, random_phase=0.0)
         e = a.env
         p.envs[0] = Env(attack=float(np.clip(e["attack"], 0.0005, 0.5)), decay=float(np.clip(e["decay"] or 0.3, 0.02, 4)),
                         sustain=float(e["sustain"]), release=float(np.clip(e["release"], 0.005, 2)))
@@ -210,7 +233,9 @@ class Optimizer:
             fc = float(a.spectrum_hz[above[-1]]) if len(above) else 2000.0
         else:
             fc = 2000.0
-        p.filter = Filter(enabled=True, type="lp24", cutoff=float(np.clip(fc, 60, 15000)), reso=0.1)
+        # the custom wavetable already contains the filtered spectrum, so the
+        # filter starts disabled (structure search can still add one)
+        p.filter = Filter(enabled=False, type="lp24", cutoff=float(np.clip(fc, 60, 15000)), reso=0.1)
         p.mono = True
         bends_between = any(nt.bend for nt in a.notes)
         p.glide = 0.0 if not bends_between else 0.0
@@ -228,38 +253,15 @@ class Optimizer:
             if a.unison_hint > 0.35:
                 p.oscs[0].unison = 3
                 p.oscs[0].detune = float(np.clip(0.1 + a.unison_hint * 0.3, 0.05, 0.6))
-            if a.lfo and a.lfo["strength"] > 0.5:
+            if a.lfo and a.lfo["strength"] > 0.5 and a.lfo["feature"] == "volume":
                 lf = a.lfo
                 pts = lf["shape_points"] + [[1.0, lf["shape_points"][0][1]]]
                 p.lfos[0] = LFO(shape="custom", sync=lf["sync"], rate_hz=lf["rate_hz"], mode="trig", points=pts)
-                if lf["feature"] == "volume":
-                    p.mods.append(Mod("lfo1", "amp", -0.5))
-                else:
-                    p.mods.append(Mod("lfo1", "filter.cutoff", float(np.clip(lf["depth"] / 10, 0.1, 0.5))))
-                    p.filter.cutoff = float(np.clip(p.filter.cutoff / 2 ** (lf["depth"] / 2), 40, 12000))
+                p.mods.append(Mod("lfo1", "amp", -0.5))
             if a.noise_ratio > 0.12:
                 p.noise = NoiseOsc(enabled=True, color=float(np.clip(0.5 + a.noise_tilt / 24, 0, 1)),
                                    level=float(np.clip(a.noise_ratio, 0.05, 0.8)))
         return p
-
-    # ------------------------------------------------------------------
-    def table_candidates(self) -> list[tuple[str, float]]:
-        """(table_id, position) ordered basic-first, then stock by match."""
-        prof = self.analysis.harm_profile_db[:N_HARM_FEAT]
-        out = []
-        if not self.opts.stock_only:
-            basics = {f"basic:{n}": self.bank.frames(f"basic:{n}") for n in BASIC_TABLES}
-            for tid, fr in basics.items():
-                err = lowpass_fit_error(harmonic_features(fr), prof)
-                j = int(np.argmin(err))
-                out.append((tid, j / max(1, len(fr) - 1), float(err[j])))
-        if self.stock is not None and len(self.stock.ids):
-            for tid, pos, err in self.stock.search(prof, k=10):
-                out.append((tid, pos, err))
-        out.sort(key=lambda r: r[2])
-        basic = [r for r in out if r[0].startswith("basic:")][:4]
-        stock = [r for r in out if r[0].startswith("serum:")][:6]
-        return [(t, pos) for t, pos, _ in basic + stock]
 
     # ------------------------------------------------------------------
     def structure_moves(self, p: Patch) -> list[tuple[str, Callable[[Patch], Patch], set]]:
@@ -291,15 +293,37 @@ class Optimizer:
         free = [i for i in range(1, self.opts.max_oscs) if not p.oscs[i].enabled]
         if free:
             i = free[0]
-            for label, tab, octv in (("same table -1 oct", o0.table, -1), ("same table +1 oct", o0.table, 1),
-                                     ("saw +0", "basic:saw", 0), ("square -1 oct", "basic:square", -1)):
-                if self.opts.stock_only and tab.startswith("basic:"):
-                    continue
-                def f(q, i=i, tab=tab, octv=octv):
+            opts_b = [("same table -1 oct", o0.table, -1, 0.0), ("same table +1 oct", o0.table, 1, 0.0),
+                      ("same table detuned", o0.table, 0, 7.0)]
+            single = self.custom_ids.get("single cycle")
+            if single and single != o0.table:
+                opts_b.append(("single-cycle table", single, 0, 0.0))
+            for label, tab, octv, fine in opts_b:
+                def f(q, i=i, tab=tab, octv=octv, fine=fine):
                     q.oscs[i] = Osc(enabled=True, table=tab, octave=q.oscs[0].octave + octv,
-                                    position=q.oscs[0].position, level=0.4, fine=7.0 if octv == 0 else 0.0)
+                                    position=q.oscs[0].position, level=0.4, fine=fine, random_phase=0.0)
                     return q
                 mv(f"osc {'ABC'[i]}: {label}", f, {"osc"})
+        # Serum warp modes on osc A: FM / AM / RM from osc B (B as a pure
+        # modulator at level 0) or from the sub oscillator
+        if o0.warp == "none":
+            free_b = not p.oscs[1].enabled
+            for mode, ratio in (("fm_b", 0), ("fm_b", 12), ("fm_b", -12), ("fm_b", 7), ("fm_sub", None),
+                                ("rm_b", 12), ("am_b", 0)):
+                if mode.endswith("_b") and not free_b:
+                    continue
+
+                def f(q, mode=mode, ratio=ratio):
+                    q.oscs[0].warp, q.oscs[0].warp_amount = mode, 0.25
+                    if mode.endswith("_b"):
+                        q.oscs[1] = Osc(enabled=True, table=self.sine_id(), level=0.0, random_phase=0.0,
+                                        octave=q.oscs[0].octave + ratio // 12, semi=ratio % 12)
+                    else:
+                        q.sub = SubOsc(enabled=True, shape="sine", octave=-1, level=0.0)
+                    return q
+                label = {"fm": "FM", "am": "AM", "rm": "RM"}[mode[:2]]
+                src = "sub" if mode.endswith("_sub") else f"osc B sine {'+' if (ratio or 0) >= 0 else ''}{ratio} st"
+                mv(f"{label} warp on osc A from {src}", f, {"osc"})
         used = {m.source for m in p.mods}
         lfo_slot = next((k for k in range(4) if f"lfo{k+1}" not in used), None)
         if a.lfo and lfo_slot is not None:
@@ -349,6 +373,13 @@ class Optimizer:
                 q.eq = EQ(enabled=True)
                 return q
             mv("EQ shelves", f, {"fx"})
+        if not p.filter.enabled:
+            for ft in ("lp24", "hp12"):
+                def f(q, ft=ft):
+                    q.filter.enabled, q.filter.type = True, ft
+                    q.filter.cutoff = 8000.0 if ft == "lp24" else 40.0
+                    return q
+                mv(f"add filter ({ft})", f, {"filter"})
         if p.filter.enabled:
             for ft in ("lp12", "bp12", "hp12"):
                 if ft != p.filter.type:
@@ -370,6 +401,15 @@ class Optimizer:
             moves.append((name, fn))
         if p.noise.enabled:
             mv("noise", lambda q: (setattr(q.noise, "enabled", False), q)[1])
+        if p.oscs[0].warp != "none":
+            def drop_warp(q):
+                q.oscs[0].warp, q.oscs[0].warp_amount = "none", 0.0
+                if q.oscs[1].enabled and q.oscs[1].level == 0:
+                    q.oscs[1].enabled = False
+                if q.sub.enabled and q.sub.level == 0:
+                    q.sub.enabled = False
+                return q
+            mv(f"{p.oscs[0].warp} warp", drop_warp)
         if p.sub.enabled:
             mv("sub", lambda q: (setattr(q.sub, "enabled", False), q)[1])
         for i in (1, 2):
@@ -397,32 +437,26 @@ class Optimizer:
         self.report("init", f"initial guess from Fourier analysis: {score:.1f}")
         self.stages.append({"stage": "analysis guess", "score": round(score, 2)})
 
-        # --- 2. table search -------------------------------------------------
-        cands = self.table_candidates()
-        self.set_stage("tables", f"{len(cands)} candidate wavetables")
+        # --- 2. custom wavetables --------------------------------------------
+        cands = self.custom_table_patches(p)
+        self.set_stage("tables", f"{len(cands)} custom wavetable designs")
         results = []
-        per = max(30, int(min(80, self.time_left() * 0.25 / max(1, len(cands)) / 0.03)))
-        for tid, pos in cands:
-            if self.time_left() < opts.time_budget * 0.6:
-                break
-            self.activity = f"tuning with {tid}"
-            q = p.copy()
-            q.oscs[0].table = tid
-            q.oscs[0].position = float(pos)
-            q, s = self.tune(q, per, focus={"osc", "filter", "env"})
-            results.append((s, tid, q))
-            self.report("tables", f"{tid}: {s:.1f}")
+        per = max(30, int(min(90, self.time_left() * 0.25 / max(1, len(cands)) / 0.03)))
+        for label, q in cands:
+            self.activity = f"tuning the '{label}' wavetable"
+            q, s = self.tune(q, per, focus={"osc", "env", "mod"})
+            results.append((s, label, q))
+            self.report("tables", f"custom wavetable '{label}': {s:.1f}")
         results.sort(key=lambda r: -r[0])
         if results:
-            score, _, p = results[0]
-        self.stages.append({"stage": "wavetable search", "score": round(score, 2),
-                            "table": p.oscs[0].table,
+            score, label, p = results[0]
+        self.stages.append({"stage": "custom wavetable", "score": round(score, 2), "table": label,
                             "candidates": [{"table": t, "score": round(s, 2)} for s, t, _ in results]})
 
         # --- 3. greedy structure search -------------------------------------
         added = []
         while self.time_left() > opts.time_budget * 0.3 and score < 99.0:
-            if added and self.accuracy(p, score) >= opts.target_score:
+            if added and self.ref.waveform(self.render(p)) >= opts.target_score:
                 break
             moves = self.structure_moves(p)
             self.set_stage("structure", f"screening {len(moves)} possible additions")
@@ -471,115 +505,134 @@ class Optimizer:
         # --- 5. fine-tune ----------------------------------------------------
         budget = int(max(40, self.time_left() * 0.6 / 0.03))
         self.set_stage("fine-tune", f"all {len(P.continuous_params(p))} parameters together")
+        self.reserve = 0.25 * opts.time_budget      # keep time for waveform alignment
         p, score = self.tune(p, budget, sigma=0.08)
         self.report("fine-tune", f"{score:.1f}")
         self.stages.append({"stage": "fine-tune", "score": round(score, 2)})
 
-        # --- 6. custom wavetable ---------------------------------------------
-        used_custom = False
-        if self.accuracy(p, score) < opts.target_score and opts.allow_custom and self.time_left() > 5:
-            self.set_stage("custom", "building a wavetable from the measured harmonics")
-            q = self.custom_table_patch(p)
-            if q is not None:
-                q, s = self.tune(q, int(max(30, self.time_left() * 0.9 / 0.03)), sigma=0.1)
-                self.report("custom", f"custom wavetable: {s:.1f}")
-                self.stages.append({"stage": "custom wavetable", "score": round(s, 2)})
-                if s > score + 0.5:
-                    p, score, used_custom = q, s, True
+        # --- 6. waveform alignment --------------------------------------------
+        self.reserve = 0.0
+        if self.time_left() > 2:
+            self.set_stage("waveform", "start phase, fine tune and attack against the literal waveform")
+            ps = []
+            for i, o in p.active_oscs():
+                ps += [P.Param(f"oscs.{i}.phase", 0.0, 1.0), P.Param(f"oscs.{i}.fine", -25.0, 25.0)]
+            ps += [P.Param("envs.0.attack", 0.0005, 0.2, log=True), P.Param("envs.0.decay", 0.01, 6.0, log=True),
+                   P.Param("envs.0.sustain", 0.0, 1.0), P.Param("envs.0.release", 0.005, 2.0, log=True)]
+            before = self.ref.waveform(self.render(p))
+            self.refine_note_timing(p)
+            p, _ = self.tune(p, int(max(40, self.time_left() * 0.8 / 0.03)), sigma=0.25, objective="wave", params=ps)
+            self.refine_note_timing(p, span=0.003)
+            after = self.ref.waveform(self.render(p))
+            self.report("waveform", f"waveform similarity {before:.1f} -> {after:.1f}")
+            self.stages.append({"stage": "waveform alignment", "score": round(after, 2)})
 
-        self.set_stage("final", "measuring phase-noise ceiling")
-        total, details = self.final_score(p)
-        return Result(patch=p, score=total, details=details, notes=self.analysis.notes, bank=self.bank,
-                      history=self.history, used_custom=used_custom, stages=self.stages)
+        self.set_stage("final", "computing similarity metrics")
+        metrics = self.ref.all(self.render(p))
+        total = metrics["waveform_similarity"]
+        return Result(patch=p, score=total, details=metrics, notes=self.analysis.notes, bank=self.bank,
+                      history=self.history, used_custom=True, stages=self.stages)
+
+    def refine_note_timing(self, p: Patch, span: float = 0.006, steps: int = 13) -> None:
+        """Shift each note start (end fixed) within +-span to maximise the
+        waveform correlation. The notes are shared with the analysis, so the
+        exported MIDI gets the refined timing too."""
+        for nt in self.notes:
+            if self.time_left() < 1:
+                return
+            s0, e0 = nt.start, nt.start + nt.duration
+            best_s, best_v = s0, self.ref.waveform(self.render(p))
+            for d in np.linspace(-span, span, steps):
+                nt.start = max(0.0, s0 + d)
+                nt.duration = e0 - nt.start
+                v = self.ref.waveform(self.render(p))
+                if v > best_v:
+                    best_s, best_v = nt.start, v
+            nt.start, nt.duration = round(best_s, 5), round(e0 - best_s, 5)
+            self._last_beat = 0     # keep the UI heartbeat alive
+
+    def sine_id(self) -> str:
+        """A one-frame custom sine table (modulator for FM/AM/RM)."""
+        if "sine" not in self.custom_ids:
+            k = np.zeros(2)
+            k[0] = 1.0
+            self.custom_ids["sine"] = self.bank.add_custom(custom_table_from_harmonics(k[None, :1]))
+        return self.custom_ids["sine"]
 
     # ------------------------------------------------------------------
-    def custom_table_patch(self, p: Patch) -> Patch | None:
-        """Bake the measured harmonic spectra into a wavetable.
-
-        With a detected LFO the frames are one LFO cycle (phase-folded) and
-        the LFO sweeps the table position, which is how wub basses are built.
-        Without one, frames follow the longest note over time and Env2
-        sweeps the position."""
+    def custom_table_patches(self, p: Patch) -> list[tuple[str, Patch]]:
+        """Candidate patches, each with a wavetable built from the measured
+        harmonic magnitudes and phases (relative to the fundamental)."""
         a = self.analysis
         mag, ph, times = a.harm_mag, a.harm_phase, a.times
-        loud = a.rms_db > a.rms_db.max() - 30
+        loud = (a.rms_db > a.rms_db.max() - 30) & (mag.max(axis=1) > 0)
         if not loud.any():
-            return None
+            loud = mag.max(axis=1) > 0
+        out = []
+        self.custom_ids = {}
+
+        # frames keep their level relative to each other (a closing filter is
+        # also a quieter frame); only the overall table is normalised
+        ref = float(np.percentile(mag[loud].max(axis=1), 95)) + 1e-12 if loud.any() else 1.0
+
+        def frames_of(idx):
+            return np.clip(mag[idx] / ref, 0, 4)
+
+        def circ_mean(idx):
+            return np.angle(np.exp(1j * ph[idx]).mean(axis=0))
+
+        idx_all = np.nonzero(loud)[0]
+        if len(idx_all) == 0:
+            return [("single cycle", p.copy())]
+        # 1. single cycle: median spectrum
+        tid = self.bank.add_custom(custom_table_from_harmonics(
+            np.median(frames_of(idx_all), axis=0)[None, :], circ_mean(idx_all)[None, :]))
+        self.custom_ids["single cycle"] = tid
         q = p.copy()
-        frames_mag, frames_ph = [], []
+        q.oscs[0].table, q.oscs[0].position, q.oscs[0].random_phase = tid, 0.0, 0.0
+        out.append(("single cycle", q))
+        # 2. evolving through the longest note (Env2 sweeps the position)
+        nt = max(a.notes, key=lambda n: n.duration)
+        i0, i1 = np.searchsorted(times, [nt.start, nt.start + nt.duration])
+        idx = [i for i in range(i0, i1) if loud[i]]
+        if len(idx) >= 4:
+            nfr = int(min(64, len(idx)))
+            d = max(nt.duration, 0.05)
+            pos = np.linspace(0, 0.99, nfr)
+            t_sel = -d / 4.6 * np.log(1 - pos)   # Env2 decay is exponential
+            sel = [idx[min(len(idx) - 1, int(np.searchsorted(times[idx] - nt.start, t)))] for t in t_sel]
+            tid = self.bank.add_custom(custom_table_from_harmonics(frames_of(sel), ph[sel]))
+            self.custom_ids["evolving"] = tid
+            q = p.copy()
+            q.oscs[0].table, q.oscs[0].position, q.oscs[0].random_phase = tid, 1.0, 0.0
+            q.envs[1] = Env(attack=0.0005, decay=d, sustain=0.0, release=0.05)
+            q.mods = [m for m in q.mods if m.dest != "osc1.pos"] + [Mod("env2", "osc1.pos", -1.0)]
+            out.append(("evolving", q))
+        # 3. one LFO cycle (the LFO sweeps the position)
         if a.lfo and a.lfo["strength"] > 0.4:
             period = a.lfo["period_s"]
             nb = 32
             acc = [[] for _ in range(nb)]
-            for nt in a.notes:
-                i0, i1 = np.searchsorted(times, [nt.start, nt.start + nt.duration])
-                for i in range(i0, i1):
+            for n in a.notes:
+                j0, j1 = np.searchsorted(times, [n.start, n.start + n.duration])
+                for i in range(j0, j1):
                     if loud[i]:
-                        b = int(((times[i] - nt.start) / period % 1.0) * nb)
-                        acc[min(b, nb - 1)].append(i)
+                        acc[min(int(((times[i] - n.start) / period % 1.0) * nb), nb - 1)].append(i)
+            fm, fp = [], []
             for b in range(nb):
-                idx = acc[b] or acc[(b - 1) % nb] or [int(np.argmax(a.rms_db))]
-                m = mag[idx]
-                m = m / (m.max(axis=1, keepdims=True) + 1e-12)
-                frames_mag.append(np.median(m, axis=0))
-                frames_ph.append(np.angle(np.exp(1j * ph[idx]).mean(axis=0)))
-            tid = self.bank.add_custom(custom_table_from_harmonics(np.array(frames_mag), np.array(frames_ph)))
+                ib = acc[b] or acc[(b - 1) % nb] or list(idx_all[:1])
+                fm.append(np.median(frames_of(ib), axis=0))
+                fp.append(circ_mean(ib))
+            tid = self.bank.add_custom(custom_table_from_harmonics(np.array(fm), np.array(fp)))
+            self.custom_ids["LFO cycle"] = tid
+            q = p.copy()
             k = next((k for k in range(4) if not any(m.source == f"lfo{k+1}" for m in q.mods)), 3)
             q.lfos[k] = LFO(shape="saw_up", sync=a.lfo["sync"], rate_hz=a.lfo["rate_hz"], mode="trig")
-            q.oscs[0].position = 0.0
-            q.mods = [m for m in q.mods if m.dest not in ("osc1.pos", "filter.cutoff")]
-            q.mods.append(Mod(f"lfo{k+1}", "osc1.pos", 1.0))
-        else:
-            nt = max(a.notes, key=lambda n: n.duration)
-            i0, i1 = np.searchsorted(times, [nt.start, nt.start + nt.duration])
-            idx = [i for i in range(i0, i1) if loud[i]] or [int(np.argmax(a.rms_db))]
-            nfr = int(min(64, len(idx)))
-            # env2 decays exponentially (pos = 1 - exp(-4.6 t / d)); sample frames to match
-            d = max(nt.duration, 0.05)
-            pos = np.linspace(0, 0.99, nfr)
-            t_sel = -d / 4.6 * np.log(1 - pos)
-            sel = [idx[min(len(idx) - 1, int(np.searchsorted(times[idx] - nt.start, t)))] for t in t_sel]
-            m = mag[sel]
-            frames_mag = m / (m.max(axis=1, keepdims=True) + 1e-12)
-            frames_ph = ph[sel]
-            tid = self.bank.add_custom(custom_table_from_harmonics(frames_mag, frames_ph))
-            q.envs[1] = Env(attack=0.0005, decay=d, sustain=0.0, release=0.05)
-            q.mods = [m for m in q.mods if m.dest not in ("osc1.pos", "filter.cutoff")]
-            q.oscs[0].position = 1.0
-            q.mods.append(Mod("env2", "osc1.pos", -1.0))
-        q.oscs[0].table = tid
-        q.oscs[0].unison = 1
-        q.filter.enabled = False      # the filter is baked into the table
-        return q
-
-    def accuracy(self, p: Patch, raw: float) -> float:
-        """Phase-adjusted accuracy for a raw score (see final_score)."""
-        y = self.renderer.render(p, self.notes, self.duration)
-        alt = Renderer(self.bank, OPT_SR, seed=11).render(p, self.notes, self.duration)
-        self_sim = float(np.clip(Target(alt, OPT_SR).score(y), 1.0, 100.0))
-        return min(100.0, raw / self_sim * 100.0)
-
-    def final_score(self, p: Patch):
-        """Raw score plus a phase-adjusted accuracy.
-
-        Unison, noise and random oscillator phase make every render of the
-        *same* patch slightly different (Serum behaves the same way), so even
-        a perfect patch cannot reach 100 raw. We measure that floor by
-        comparing the patch with itself rendered with different random
-        phases and report raw / self_similarity as the accuracy."""
-        y = self.renderer.render(p, self.notes, self.duration)
-        raw, details = self.target.score(y, detail=True)
-        selfs = []
-        for seed in (11, 23):
-            alt = Renderer(self.bank, OPT_SR, seed=seed).render(p, self.notes, self.duration)
-            selfs.append(Target(alt, OPT_SR).score(y))
-        self_sim = float(np.clip(np.mean(selfs), 1.0, 100.0))
-        accuracy = float(min(100.0, raw / self_sim * 100.0))
-        details = dict(details)
-        details["raw_score"] = round(raw, 2)
-        details["self_similarity"] = round(self_sim, 2)
-        return accuracy, details
+            q.oscs[0].table, q.oscs[0].position, q.oscs[0].random_phase = tid, 0.0, 0.0
+            q.mods = [m for m in q.mods if m.dest != "osc1.pos"] + [Mod(f"lfo{k+1}", "osc1.pos", 1.0)]
+            out.append(("LFO cycle", q))
+        return out
 
 
-def reconstruct(y, sr, analysis, options=None, bank=None, stock=None, progress=None) -> Result:
-    return Optimizer(y, sr, analysis, options, bank, stock, progress).run()
+def reconstruct(y, sr, analysis, options=None, bank=None, progress=None, context_gain=None) -> Result:
+    return Optimizer(y, sr, analysis, options, bank, None, progress, context_gain).run()

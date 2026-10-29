@@ -113,6 +113,8 @@ def _pip_install(req: Path, log_cb=None) -> None:
     if Path(uv).exists():
         cmd = [uv, "pip", "install", "--python", py, "-r", str(req)]
     else:
+        # venvs made by uv have no pip unless seeded; bootstrap it if needed
+        subprocess.run([py, "-m", "ensurepip", "--upgrade"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         cmd = [py, "-m", "pip", "install", "-r", str(req)]
     if log_cb:
         log_cb("installing dependencies: " + " ".join(cmd))

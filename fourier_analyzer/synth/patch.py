@@ -18,6 +18,7 @@ MAX_OSCS = 3
 LFO_SHAPES = ("sine", "triangle", "saw_down", "saw_up", "square", "custom")
 FILTER_TYPES = ("lp12", "lp24", "hp12", "hp24", "bp12")
 DIST_MODES = ("soft", "hard", "tube", "sinefold", "linfold", "diode")
+WARP_MODES = ("none", "fm_b", "fm_sub", "am_b", "rm_b", "rm_sub")
 MOD_SOURCES = ("env1", "env2", "env3", "lfo1", "lfo2", "lfo3", "lfo4")
 # amount 1.0 means: cutoff +10 octaves, pos +1 (whole table), level +1,
 # pitch +48 semitones, drive +1.
@@ -39,7 +40,13 @@ class Osc:
     unison: int = 1
     detune: float = 0.1           # 0..1, Serum-style detune amount
     blend: float = 0.75           # 0..1 level of the outer unison voices
-    random_phase: float = 1.0     # 0..1
+    random_phase: float = 1.0     # 0..1 (0 = every note starts at `phase`)
+    phase: float = 0.0            # 0..1 start phase of the cycle at note-on
+    # Serum warp mode applied to this oscillator: none | fm_b | fm_sub | am_b |
+    # rm_b | rm_sub (FM = phase modulation by osc B / sub, AM/RM = amplitude
+    # / ring modulation). Osc B can sit at level 0 and act only as modulator.
+    warp: str = "none"
+    warp_amount: float = 0.0      # 0..1
 
 
 @dataclass
@@ -190,9 +197,10 @@ class Patch:
         out = []
         for i, o in self.active_oscs():
             uni = f", unison {o.unison} x detune {o.detune:.2f}" if o.unison > 1 else ""
+            warp = f", warp {o.warp} {o.warp_amount:.2f}" if o.warp != "none" and o.warp_amount else ""
             out.append(f"Osc {'ABC'[i]}: {o.table} @ pos {o.position:.2f}, "
                        f"oct {o.octave:+d} semi {o.semi:+d} fine {o.fine:+.0f}c, "
-                       f"level {o.level:.2f}{uni}")
+                       f"level {o.level:.2f}{uni}{warp}")
         if self.sub.enabled:
             out.append(f"Sub: {self.sub.shape} oct {self.sub.octave:+d} level {self.sub.level:.2f}")
         if self.noise.enabled:

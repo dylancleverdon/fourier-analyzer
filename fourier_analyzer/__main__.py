@@ -34,8 +34,6 @@ def main(argv=None):
     rc.add_argument("--end", type=float, default=None)
     rc.add_argument("--bpm", type=float, default=None)
     rc.add_argument("--target", type=float, default=90)
-    rc.add_argument("--stock-only", action="store_true")
-    rc.add_argument("--no-custom", action="store_true")
     rc.add_argument("--time", type=float, default=240)
     rc.add_argument("--out", default=".")
     up = sub.add_parser("update")
@@ -82,24 +80,22 @@ def _reconstruct_cli(args):
     from .export import write_midi
     from .match.optimizer import OPT_SR, Options, Optimizer
     from .serum.mapping import build_preset_bytes
-    from .synth.wavetables import StockIndex, TableBank
+    from .synth.wavetables import TableBank
     y, sr = audio.load(args.file, sr=OPT_SR)
     a0 = int((args.start or 0) * sr)
     b0 = int((args.end or len(y) / sr) * sr)
     y = y[a0:b0]
     an = analyze(y, sr, bpm=args.bpm)
     bank = TableBank()
-    stock = StockIndex().build() if config.serum_tables_dir() else None
-    opt = Optimizer(y, sr, an, Options(target_score=args.target, allow_custom=not args.no_custom,
-                                       stock_only=args.stock_only, time_budget=args.time),
-                    bank=bank, stock=stock, progress=lambda st, f, b, m: print(f"[{st}] {b:.1f} {m}"))
+    opt = Optimizer(y, sr, an, Options(target_score=args.target, time_budget=args.time),
+                    bank=bank, progress=lambda st, f, b, m, *_: m and print(f"[{st}] {m}"))
     res = opt.run()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     name = Path(args.file).stem + " FA"
     (out / f"{name}.SerumPreset").write_bytes(build_preset_bytes(res.patch, bank, name=name))
     write_midi(out / f"{name}.mid", an.notes, an.bpm)
-    print(f"accuracy {res.score:.1f}  {res.details}")
+    print(f"waveform similarity {res.score:.1f}%  {res.details}")
     print("\n".join(res.patch.describe()))
 
 
