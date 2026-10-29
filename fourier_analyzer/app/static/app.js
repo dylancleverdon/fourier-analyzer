@@ -677,7 +677,12 @@ $("#saveSettings").onclick = async () => {
 $("#calibrateBtn").onclick = async () => {
   const r = await post("/api/calibrate"); $("#settings").close();
   pollJob(r.job, async (j) => {
-    if (j.status === "done") { alert("Calibrated: " + JSON.stringify(j.result)); return; }
+    if (j.status === "done") {
+      const r = j.result || {}, hz = (v) => v == null ? "?" : v >= 1000 ? (v / 1000).toFixed(2) + " kHz" : Math.round(v) + " Hz";
+      alert(`✓ Calibration complete\n\nRead Serum 2's real filter curve: knob at 0% = ${hz(r.cutoff_hz_at_0)}, 50% = ${hz(r["cutoff_hz_at_0.5"])}, 100% = ${hz(r.cutoff_hz_at_1)}.\n` +
+            `Also saved ${Math.max(0, (r.params_read || []).length - 1)} other parameter curves (envelopes, LFO rate, unison, wavetable position).\n\nNew presets now use these measured values.`);
+      return;
+    }
     // show the diagnostics file in Finder so it is easy to find and send
     let where = "";
     try { where = (await post("/api/diagnostics/reveal")).path; } catch (e) { /* none written */ }
