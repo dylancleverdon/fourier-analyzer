@@ -101,20 +101,48 @@ def _swap_in_state(state: bytes, preset: bytes) -> bytes | None:
     return plistlib.dumps(pl, fmt=plistlib.FMT_BINARY)
 
 
+def _open_plugin(paths: list[Path]):
+    """Load the Serum 2 *instrument* (not "Serum 2 FX") from the first plugin
+    file that works. Every failure is collected so the real reason is shown."""
+    import re
+
+    import pedalboard
+    errors = []
+    for path in paths:
+        tried = set()
+        queue = ["Serum 2"]
+        while queue:
+            name = queue.pop(0)
+            if name in tried:
+                continue
+            tried.add(name)
+            try:
+                return pedalboard.load_plugin(str(path), plugin_name=name), f"{path} [{name}]"
+            except Exception as e:
+                msg = str(e)
+                errors.append(f"{path.name} as '{name}': {type(e).__name__}: {msg[:300]}")
+                # pedalboard lists the plugins inside the file in the message
+                for found in re.findall(r'"([^"]+)"', msg):
+                    if "fx" not in found.lower() and found not in tried:
+                        queue.append(found)
+    raise SerumHostError("Could not load the Serum 2 instrument. Tried: " + " | ".join(errors)
+                         if errors else "Serum 2 plugin not found (looked for Serum2.vst3 / Serum2.component)")
+
+
 class SerumHost:
+    """Runs inside the helper process (main thread). Use render_jobs() from
+    the app, never this class directly on a worker thread."""
+
     def __init__(self, plugin_path: str | Path | None = None, sr: int = 44100):
-        self.path = Path(plugin_path) if plugin_path else config.serum_plugin_path()
-        if not self.path:
-            raise SerumHostError("Serum 2 plugin not found (looked for Serum2.component / Serum2.vst3)")
+        paths = [Path(plugin_path)] if plugin_path else config.serum_plugin_paths()
+        if not paths:
+            raise SerumHostError("Serum 2 plugin not found (looked for Serum2.vst3 / Serum2.component)")
         try:
-            import pedalboard
+            import pedalboard  # noqa: F401
         except Exception as e:
             raise SerumHostError(f"pedalboard not installed: {e}")
         self.sr = sr
-        try:
-            self.plugin = pedalboard.load_plugin(str(self.path), plugin_name="Serum 2")
-        except Exception:
-            self.plugin = pedalboard.load_plugin(str(self.path))
+        self.plugin, self.description = _open_plugin(paths)
         self.base_state = bytes(self.plugin.raw_state)
 
     def load_preset(self, preset: bytes) -> None:
@@ -145,19 +173,84 @@ class SerumHost:
         return y[: int(duration * self.sr)]
 
 
+# ----------------------------------------------------------------------------
+# helper process: plugins are loaded on that process's main thread, and a
+# plugin crash cannot take the app down
+
+
+def host_main(job_file: str) -> int:
+    """Entry point of ``python -m fourier_analyzer serum-host job.json``."""
+    import json
+
+    import soundfile as sf
+    from ..synth.patch import Note
+    job = json.loads(Path(job_file).read_text())
+    result = {"ok": False}
+    try:
+        host = SerumHost(sr=job.get("sr", 44100))
+        result["plugin"] = host.description
+        for r in job["renders"]:
+            host.load_preset(Path(r["preset"]).read_bytes())
+            notes = [Note(**n) for n in r["notes"]]
+            y = host.render(notes, float(r["duration"]))
+            sf.write(r["out"], y, host.sr, subtype="FLOAT")
+        result["ok"] = True
+    except Exception as e:
+        import traceback
+        result["error"] = f"{type(e).__name__}: {e}"
+        result["trace"] = traceback.format_exc()[-2000:]
+    Path(job["result"]).write_text(json.dumps(result))
+    return 0 if result["ok"] else 1
+
+
+def render_jobs(renders: list[tuple[bytes, list, float]], sr: int = 44100, timeout: float | None = None):
+    """Render several (preset_bytes, notes, duration) in real Serum 2 via the
+    helper process. Returns (list of arrays, plugin description)."""
+    import json
+    import subprocess
+    import sys
+    import tempfile
+
+    import soundfile as sf
+    if not config.serum_plugin_paths():
+        raise SerumHostError("Serum 2 plugin not found (looked for Serum2.vst3 / Serum2.component)")
+    with tempfile.TemporaryDirectory(prefix="fa-serum-") as td:
+        td = Path(td)
+        job = {"sr": sr, "result": str(td / "result.json"), "renders": []}
+        for i, (preset, notes, dur) in enumerate(renders):
+            (td / f"p{i}.SerumPreset").write_bytes(preset)
+            job["renders"].append({"preset": str(td / f"p{i}.SerumPreset"),
+                                   "notes": [n.to_dict() if hasattr(n, "to_dict") else n for n in notes],
+                                   "duration": dur, "out": str(td / f"r{i}.wav")})
+        (td / "job.json").write_text(json.dumps(job))
+        cmd = [sys.executable, "-m", "fourier_analyzer", "serum-host", str(td / "job.json")]
+        try:
+            proc = subprocess.run(cmd, cwd=str(config.code_dir()), capture_output=True, text=True,
+                                  timeout=timeout or (90 + 30 * len(renders)))
+        except subprocess.TimeoutExpired:
+            raise SerumHostError("Serum 2 did not finish rendering in time (helper process timed out)")
+        res_path = td / "result.json"
+        if not res_path.exists():
+            tail = (proc.stderr or proc.stdout or "")[-1500:]
+            raise SerumHostError(f"Serum helper process crashed (exit {proc.returncode}). {tail}")
+        res = json.loads(res_path.read_text())
+        if not res.get("ok"):
+            raise SerumHostError(res.get("error", "unknown error"))
+        out = [sf.read(r["out"], dtype="float32")[0] for r in job["renders"]]
+        return out, res.get("plugin", "")
+
+
 def verify(preset: bytes, notes, y_target: np.ndarray, sr: int, gain=None) -> dict:
     """Render the preset in real Serum and score it. Never raises."""
     try:
-        host = SerumHost(sr=44100)
-        host.load_preset(preset)
-        y = host.render(notes, len(y_target) / sr)
+        (y,), plugin = render_jobs([(preset, notes, len(y_target) / sr)], sr=sr)
         if not np.any(np.abs(y) > 1e-5):
             return {"ok": False, "error": "Serum rendered silence (preset not accepted?)"}
         from ..match.metrics import Reference
         if gain is not None:
             y = y[: len(gain)] * gain[: len(y)]
         d = Reference(np.asarray(y_target, dtype=np.float64), sr).all(y)
-        return {"ok": True, "score": d["waveform_similarity"], "details": d, "audio": y}
+        return {"ok": True, "score": d["waveform_similarity"], "details": d, "audio": y, "plugin": plugin}
     except Exception as e:
         log.warning("Serum verification unavailable: %s", e)
         return {"ok": False, "error": str(e)}
@@ -169,32 +262,44 @@ def calibrate_cutoff(progress=None) -> dict:
     from ..synth.patch import Filter, Note, NoiseOsc, Osc, Patch
     from .mapping import patch_to_state
     from .preset import write_preset_bytes
-    host = SerumHost()
-    xs, fs = [], []
-    for x in np.linspace(0.3, 0.85, 6):
+    xs_all = list(np.linspace(0.3, 0.85, 6))
+    renders = []
+    for x in xs_all:
         p = Patch()
         p.oscs[0] = Osc(enabled=False)
         p.noise = NoiseOsc(enabled=True, color=0.5, level=1.0)
         p.filter = Filter(enabled=True, type="lp12", cutoff=1000)
         st = patch_to_state(p)
         st["VoiceFilter0"]["plainParams"]["kParamFreq"] = float(x)
-        host.load_preset(write_preset_bytes(st, "cal"))
-        y = host.render([Note(0, 2.0, 60)], 2.0)
-        spec = np.abs(np.fft.rfft(y[4410:] * np.hanning(len(y) - 4410))) ** 2
-        fr = np.fft.rfftfreq(len(y) - 4410, 1 / 44100)
+        renders.append((write_preset_bytes(st, "cal"), [Note(0, 2.0, 60)], 2.0))
+    if progress:
+        progress("rendering 6 test patches in Serum 2 (helper process)")
+    ys, plugin = render_jobs(renders)
+    if progress:
+        progress(f"loaded {plugin}")
+    xs, fs = [], []
+    for x, y in zip(xs_all, ys):
+        if len(y) <= 8820 or not np.any(np.abs(y) > 1e-6):
+            if progress:
+                progress(f"cutoff {x:.2f}: silent render")
+            continue
+        seg = y[4410:]
+        spec = np.abs(np.fft.rfft(seg * np.hanning(len(seg)))) ** 2
+        fr = np.fft.rfftfreq(len(seg), 1 / 44100)
         sm = np.convolve(spec, np.ones(200) / 200, mode="same")
         ref = np.median(sm[(fr > 40) & (fr < 80)])
         below = np.nonzero((fr > 50) & (sm < ref * 0.5))[0]
         if len(below):
-            xs.append(x)
-            fs.append(fr[below[0]])
+            xs.append(float(x))
+            fs.append(float(fr[below[0]]))
         if progress:
             progress(f"cutoff {x:.2f} -> {fs[-1] if fs else '?'} Hz")
     if len(xs) < 3:
-        raise SerumHostError("calibration failed")
+        raise SerumHostError("calibration failed: Serum rendered silence or no measurable cutoff "
+                             "(the preset may not have been accepted)")
     k, c = np.polyfit(xs, np.log(fs), 1)
     lo, hi = float(np.exp(c)), float(np.exp(c + k))
     s = config.settings().get("serum_scales", {})
     s.update({"cutoff_lo_hz": lo, "cutoff_hi_hz": hi})
     config.save_settings(serum_scales=s)
-    return {"cutoff_lo_hz": lo, "cutoff_hi_hz": hi, "points": list(zip(xs, fs))}
+    return {"cutoff_lo_hz": lo, "cutoff_hi_hz": hi, "points": list(zip(xs, fs)), "plugin": plugin}

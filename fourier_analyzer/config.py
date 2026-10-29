@@ -101,11 +101,14 @@ SERUM_PRESET_CANDIDATES = [
     "/Library/Audio/Presets/Xfer Records/Serum 2 Presets/Presets",
     "~/Library/Audio/Presets/Xfer Records/Serum 2 Presets/Presets",
 ]
+# VST3 first: it loads more reliably outside a DAW than the Audio Unit
 SERUM_PLUGIN_CANDIDATES = [
-    "/Library/Audio/Plug-Ins/Components/Serum2.component",
-    "~/Library/Audio/Plug-Ins/Components/Serum2.component",
     "/Library/Audio/Plug-Ins/VST3/Serum2.vst3",
     "~/Library/Audio/Plug-Ins/VST3/Serum2.vst3",
+    "/Library/Audio/Plug-Ins/Components/Serum2.component",
+    "~/Library/Audio/Plug-Ins/Components/Serum2.component",
+    "/Library/Audio/Plug-Ins/VST3/Serum 2.vst3",
+    "/Library/Audio/Plug-Ins/Components/Serum 2.component",
 ]
 
 
@@ -145,3 +148,16 @@ def serum_user_presets_dir() -> Path:
 
 def serum_plugin_path() -> Path | None:
     return _first_existing(SERUM_PLUGIN_CANDIDATES, "serum_plugin_path")
+
+
+def serum_plugin_paths() -> list[Path]:
+    """Every installed Serum 2 plugin file, the user's setting first."""
+    out = []
+    s = settings().get("serum_plugin_path")
+    if s and Path(s).expanduser().exists():
+        out.append(Path(s).expanduser())
+    for c in SERUM_PLUGIN_CANDIDATES:
+        p = Path(c).expanduser()
+        if p.exists() and p not in out:
+            out.append(p)
+    return out

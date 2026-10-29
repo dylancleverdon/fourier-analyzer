@@ -41,6 +41,8 @@ def main(argv=None):
     sub.add_parser("models")
     sub.add_parser("calibrate")
     sub.add_parser("selftest")
+    sh = sub.add_parser("serum-host")          # internal: helper process for real Serum renders
+    sh.add_argument("job")
     args = ap.parse_args(argv)
     cmd = args.cmd or "app"
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -70,6 +72,9 @@ def main(argv=None):
     elif cmd == "calibrate":
         from .serum.host import calibrate_cutoff
         print(json.dumps(calibrate_cutoff(progress=print), indent=1, default=str))
+    elif cmd == "serum-host":
+        from .serum.host import host_main
+        sys.exit(host_main(args.job))
     elif cmd == "selftest":
         sys.exit(_selftest())
 
