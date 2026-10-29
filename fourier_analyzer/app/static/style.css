@@ -148,3 +148,10 @@ dialog menu { display: flex; justify-content: flex-end; gap: 8px; padding: 0; ma
 .projects .del:hover { color: var(--bad); }
 .pick { display: flex; gap: 6px; margin-top: 4px; }
 .pick input { flex: 1; margin-top: 0 !important; }
+
+/* engine accuracy */
+#engineDlg { max-width: 760px; }
+#engineDlg table { border-collapse: collapse; width: 100%; margin: 4px 0 12px; }
+#engineDlg th, #engineDlg td { text-align: left; padding: 4px 12px 4px 0; border-bottom: 1px solid rgba(127, 127, 127, 0.18); }
+#engineDlg td:not(:first-child), #engineDlg th:not(:first-child) { text-align: right; white-space: nowrap; }
+#engineGap ul { margin: 4px 0 0 18px; padding: 0; }

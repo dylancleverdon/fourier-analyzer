@@ -93,8 +93,18 @@ def continuous_params(p: Patch, focus: set[str] | None = None) -> list[Param]:
     want = (lambda g: True) if focus is None else (lambda g: g in focus)
     ps: list[Param] = []
     for i, o in p.active_oscs():
+        if want("osc") and o.type == "sample":
+            ps.append(Param(f"oscs.{i}.smp.start", 0.0, 0.5))
+            if o.smp.loop != "off":
+                ps.append(Param(f"oscs.{i}.smp.loop_start", 0.0, 0.9))
+        elif want("osc") and o.type == "granular":
+            ps += [Param(f"oscs.{i}.smp.start", 0.0, 0.9), Param(f"oscs.{i}.gran.density", 2.0, 200.0, log=True),
+                   Param(f"oscs.{i}.gran.length", 0.01, 0.5, log=True), Param(f"oscs.{i}.gran.rand_offset", 0.0, 1.0)]
+        elif want("osc") and o.type == "spectral":
+            ps += [Param(f"oscs.{i}.smp.start", 0.0, 0.9), Param(f"oscs.{i}.spec.freq_hi", 1000.0, 20000.0, log=True)]
         if want("osc"):
-            ps.append(Param(f"oscs.{i}.position", 0.0, 1.0))
+            if o.type == "wavetable":
+                ps.append(Param(f"oscs.{i}.position", 0.0, 1.0))
             if i > 0:
                 ps.append(Param(f"oscs.{i}.level", 0.02, 1.0))
                 ps.append(Param(f"oscs.{i}.fine", -50.0, 50.0))

@@ -123,6 +123,33 @@ def reveal_diagnostics():
     return {"path": str(p)}
 
 
+# ---------------------------------------------------------------- learning from Serum
+
+
+@app.get("/api/calibration")
+def calibration_summary():
+    from .. import calibration
+    return calibration.summary()
+
+
+@app.post("/api/calibration/reset")
+def calibration_reset():
+    """Forget the learned corrections (the log of past runs is kept)."""
+    from .. import calibration
+    calibration.reset_corrections()
+    return calibration.summary()
+
+
+@app.get("/api/calibration/export")
+def calibration_export():
+    """Everything learned so far as one JSON file (numbers only, no audio)."""
+    from .. import calibration
+    body = {"version": __import__("fourier_analyzer").__version__, "summary": calibration.summary(),
+            "corrections": calibration.load_corrections(), "runs": calibration.read_log()}
+    return JSONResponse(content=__import__("json").loads(__import__("json").dumps(body, default=str)),
+                        headers={"Content-Disposition": 'attachment; filename="fourier_analyzer_calibration.json"'})
+
+
 class SettingsIn(BaseModel):
     values: dict
 
@@ -364,6 +391,8 @@ class RegionIn(BaseModel):
     sidechain_in_preset: bool = False   # write the detected ducking into the preset (LFO -> Voice Amp)
     serum_tune: bool = True             # fine-tune the finished patch inside real Serum 2
     serum_tune_minutes: float = 5.0
+    learn: bool = True                  # compare our engine with Serum, find causes, learn corrections
+    learn_minutes: float = 3.0          # time for the culprit search
     verify_serum: bool = True
 
 

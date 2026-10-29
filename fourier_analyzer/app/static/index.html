@@ -12,6 +12,7 @@
   <div class="top-actions">
     <button id="updateBtn" class="pill" title="Check for updates">Checking for updates…</button>
     <button id="newWinBtn" class="ghost" title="Open another window to work on a second track at the same time (⌘N)">New window</button>
+    <button id="engineBtn" class="ghost" title="What the app has learned from comparing its engine with real Serum 2">Engine accuracy</button>
     <button id="settingsBtn" class="ghost" title="Settings">Settings</button>
   </div>
 </header>
@@ -149,6 +150,7 @@
               <label class="check"><input id="serumTune" type="checkbox" checked> fine-tune inside real Serum 2 for
                 <select id="serumTuneMin"><option value="2">2 min</option><option value="5" selected>5 min</option><option value="10">10 min</option><option value="20">20 min</option><option value="30">30 min</option><option value="60">1 hour</option></select></label>
               <div class="muted small">After the search, the patch is rendered in the actual Serum 2 plugin again and again and nudged until it matches the original there too. Skipped if Serum 2 isn't installed.</div>
+              <label class="check"><input id="learnSerum" type="checkbox" checked> learn from Serum: compare our engine with real Serum 2, find what differs and correct future presets</label>
               <label class="check"><input id="verifySerum" type="checkbox" checked> verify in real Serum 2</label>
             </div>
             <button id="runRecon" class="primary">Reconstruct</button>
@@ -160,6 +162,7 @@
                 <div id="accBadge" class="badge"></div>
                 <div id="accBars" class="bars"></div>
                 <div id="serumScore" class="muted small"></div>
+                <div id="engineGap" class="small"></div>
                 <div id="scInfo" class="muted small"></div>
               </div>
             </div>
@@ -190,6 +193,19 @@
     </section>
   </main>
 </div>
+
+<dialog id="engineDlg">
+  <form method="dialog">
+    <h3>Engine accuracy</h3>
+    <p class="muted small">After each run verified in real Serum 2, the app compares its own render with Serum's render of the same preset, switches each part of the patch off in both to find the cause of any difference, and learns corrections that are applied to every preset it writes. Only measurements are stored, no audio.</p>
+    <div id="engineBody">Loading…</div>
+    <menu>
+      <a class="btn ghost" href="/api/calibration/export" download="fourier_analyzer_calibration.json">Export report</a>
+      <button id="engineReset" type="button" class="ghost">Reset corrections</button>
+      <button value="cancel" class="primary">Close</button>
+    </menu>
+  </form>
+</dialog>
 
 <dialog id="settings">
   <form method="dialog">

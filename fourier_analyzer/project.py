@@ -399,7 +399,7 @@ def tune_serum(job: Job, res, opt, bank, y44: np.ndarray, sc: dict, bpm: float, 
         if text:
             job.msg(text)
     try:
-        patch, info = tune_in_serum(res.patch, bank, notes, y, 44100, budget_s, gain=gain,
+        patch, info = tune_in_serum(res.patch, bank, notes, y, 44100, budget_s, gain=gain, samples=res.samples,
                                     stop=stop, progress=prog)
     except SerumHostError as e:
         job.msg(f"Serum tuning skipped: {e}")
@@ -415,6 +415,53 @@ def tune_serum(job: Job, res, opt, bank, y44: np.ndarray, sc: dict, bpm: float, 
         res.score = res.details["waveform_similarity"]
         res.stages.append({"stage": "Serum 2 tuning", "score": info["after"],
                            "note": f"real Serum score {info['before']} -> {info['after']}"})
+
+
+def learn_from_serum(job: Job, res, opt, bank, notes, r44, serum_raw, y44, gain44, serum: dict, out: Path,
+                     meta: dict, budget_s: float) -> dict | None:
+    """Compare our render with Serum's render of the same preset, find which
+    component causes the difference, log it and learn corrections."""
+    from . import calibration
+    from .match.metrics import Reference
+    from .serum.host import SerumHostError, SerumSession
+    from .serum.mapping import build_preset_bytes
+    from .synth.engine import Renderer
+    job.set("learning", "Learning from Serum: comparing our engine with real Serum 2")
+    job.msg("comparing our engine's render with Serum's render of the same preset")
+    ours = r44 * gain44[: len(r44)] if gain44 is not None else r44
+    our_score = Reference(np.asarray(y44, dtype=np.float64), 44100).all(ours)["waveform_similarity"]
+    culprits = None
+    if budget_s > 0 and job.cancels < 2:
+        dur = opt.duration
+        nts = [nt for nt in notes if nt.start < dur]
+        corr = calibration.load_corrections()
+        rnd = Renderer(bank, 44100, samples=res.samples)
+        job.set("learning", "Learning from Serum: switching each component off in both engines",
+                budget=budget_s, elapsed=0)
+        try:
+            with SerumSession(44100) as sess:
+                culprits = calibration.find_culprits(
+                    res.patch, bank, res.samples, nts, dur, 44100, sess,
+                    render_ours=lambda q: rnd.render(q, nts, dur),
+                    build=lambda q: build_preset_bytes(calibration.apply_corrections(q, corr), bank,
+                                                       name="FA calibration", samples=res.samples),
+                    time_budget=budget_s, stop=lambda: job.cancels >= 2)
+        except SerumHostError as e:
+            job.msg(f"culprit search skipped: {e}")
+    try:
+        rec = calibration.record_run(patch=res.patch, ours=r44, serum=serum_raw, sr=44100, notes=notes,
+                                     our_score=our_score, serum_score=float(serum["score"]), culprits=culprits,
+                                     tuning=getattr(res, "serum_tune", None), meta=meta)
+    except Exception as e:                     # learning must never cost the user the result
+        log.warning("calibration record failed: %s", e, exc_info=True)
+        job.msg(f"learning step failed: {e}")
+        return None
+    (out / "engine_gap.txt").write_text(calibration.report_text(rec))
+    job.msg(f"our engine {rec['our_score']}% vs real Serum {rec['serum_score']}%")
+    for f in rec["findings"][:6]:
+        job.msg("  " + f)
+    return {k: rec[k] for k in ("our_score", "serum_score", "score_drop", "findings", "learned", "culprits")} | {
+        "engine_similarity": rec["engine_gap"].get("similarity")}
 
 
 def start_reconstruct(pid: str, stem: str, start, end, opts: dict) -> Job:
@@ -472,7 +519,8 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict) -> Job:
         if budget > 900:
             job.msg(f"long run: {'until stopped' if budget > 7 * 24 * 3600 else f'{budget / 60:.0f} min'}; "
                     "press Stop to finish with the best patch so far")
-        opt = Optimizer(y22, OPT_SR, a, o, bank=bank, progress=prog, context_gain=gain22)
+        opt = Optimizer(y22, OPT_SR, a, o, bank=bank, progress=prog, context_gain=gain22,
+                        source_audio=(y44, 44100))
         res = opt.run()
         if opts.get("serum_tune", False) and float(opts.get("serum_tune_minutes") or 0) > 0:
             tune_serum(job, res, opt, bank, y44, sc, bpm, float(opts["serum_tune_minutes"]) * 60)
@@ -493,11 +541,13 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict) -> Job:
         out.mkdir(parents=True)
         name = f"FA {meta['name'][:24]} {stem} {rid[:6]}"
         res.patch.name = name
-        preset = build_preset_bytes(res.patch, bank, name=name,
+        from . import calibration
+        # learned corrections: the preset is written so real Serum sounds like our render
+        preset = build_preset_bytes(calibration.apply_corrections(res.patch), bank, name=name, samples=res.samples,
                                     description=f"Reconstructed by Fourier Analyzer, accuracy {res.score:.1f}")
         (out / f"{name}.SerumPreset").write_bytes(preset)
         write_midi(out / "notes.mid", a.notes, bpm)
-        r44 = Renderer(bank, 44100).render(res.patch, a.notes, len(y44) / 44100)
+        r44 = Renderer(bank, 44100, samples=res.samples).render(res.patch, a.notes, len(y44) / 44100)
         audio.save(out / "render.wav", audio.normalize(r44), 44100)
         gain44 = SC.gain_curve(sc, len(r44), 44100) if sc["detected"] else None
         if gain44 is not None:
@@ -508,7 +558,8 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict) -> Job:
             write_serum_wav(out / f"{name} {tid.replace(':', ' ')}.wav", frames)
 
         serum = {"ok": False, "error": "skipped"}
-        if opts.get("verify_serum", True):
+        learning = bool(opts.get("learn", True))
+        if opts.get("verify_serum", True) or learning:
             job.set("serum", "Rendering the preset in the real Serum 2 plugin")
             job.progress = 0.96
             job.msg("rendering in real Serum 2 for verification")
@@ -518,6 +569,12 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict) -> Job:
                 job.msg(f"real Serum score: {serum['score']}")
             else:
                 job.msg(f"Serum verification unavailable: {serum.get('error')}")
+        raw_serum = serum.pop("raw_audio", None)
+        engine_gap = None
+        if learning and serum.get("ok") and raw_serum is not None:
+            engine_gap = learn_from_serum(job, res, opt, bank, a.notes, r44, raw_serum, y44, gain44, serum,
+                                          out, {"name": name, "stem": stem, "project": pid},
+                                          float(opts.get("learn_minutes") or 3) * 60)
         summary = {
             "id": rid, "stem": stem, "start": start, "end": end, "bpm": bpm, "name": name,
             "accuracy": round(res.score, 2), "metric": "waveform_similarity", "details": res.details,
@@ -526,7 +583,8 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict) -> Job:
             "sidechain": {k: v for k, v in sc.items() if k != "kicks"},
             "sidechain_logic": SC.logic_settings(sc),
             "patch": res.patch.to_dict(), "description": res.patch.describe(), "stages": res.stages,
-            "checks": checks, "serum": serum, "serum_tune": getattr(res, "serum_tune", None), "analysis": a.summary(), "evals": opt.evals,
+            "checks": checks, "serum": serum, "serum_tune": getattr(res, "serum_tune", None),
+            "engine_gap": engine_gap, "analysis": a.summary(), "evals": opt.evals,
             "files": sorted(p.name for p in out.iterdir()),
         }
         exp = config.exports_dir() / meta["name"][:60] / f"{stem} {rid}"

@@ -60,6 +60,7 @@ There is deliberately no signing or checksum verification; update speed was prio
       - FX-rack modules: distortion modes, chorus, flanger, phaser, hyperdimension, frequency shifter, FX filter, compressor, reverb, convolve and tempo-synced delay, plus a multiband split
       - OTT, EQ and glide
       - unison detune modes, warps on osc B and C, amp-envelope curve shapes and hold
+      - **sample, granular and spectral oscillators** playing a note cut from the original (in place of osc A or as an extra layer); the audio is embedded in the preset
    3. **Pruning** removes each component in turn and drops it if the fit holds.
    4. **Fine-tuning** of every parameter with CMA-ES.
    5. **Exploration** (search times over 15 min): after the first full pass (about 15 min), the search keeps experimenting until the time runs out: fresh rounds of structure moves, pruning and CMA-ES restarts, keeping only what improves the fit.
@@ -99,6 +100,18 @@ When ducking is found:
 - it is **re-applied to every render before comparing**, so the patch is judged as it sounds in the track;
 - the result shows matching **Logic Compressor sidechain settings**, because the ducking usually lives in the DAW;
 - the preset gets a tempo-synced LFO → Voice Amp shaped like the ducking. Its matrix slot is **bypassed** unless you tick **put detected sidechain ducking into the preset**, in which case it ducks inside Serum.
+
+### Learning from Serum (engine accuracy)
+
+On by default (**learn from Serum** in the reconstruct options). After the preset is verified in real Serum 2, the app compares **its own render with Serum's render of the same preset**. That difference is the *engine gap*: what the app's copy of Serum gets wrong, kept separate from how well the patch fits the original.
+
+For each run it:
+- **documents exactly what differs** between the two renders: overall level, timing offset, every 1/3-octave band, spectral tilt and brightness, noisiness, and per note the attack, decay, sustain, release, onset, pitch (cents), harmonic balance and amplitude modulation. These become plain-language findings ("Serum is darker, −2.3 dB per octave", "Serum's release tail is 120 ms longer");
+- **finds the cause**: every part of the patch (each FX module, filter, warp, unison, oscillator, noise, sub, matrix route, glide) is switched off in both engines in turn; the part whose removal closes the gap is the one emulated wrongly;
+- **learns corrections**: the Serum tuning stage shows how far each parameter had to move to match the original in real Serum. Once at least 5 runs agree on the same offset for a parameter (for example "lp24 cutoff needs ×1.18"), that correction is applied to every preset the app writes;
+- **logs everything** as numbers only (no audio) in `~/Library/Application Support/FourierAnalyzer/data/calibration/`, and writes `engine_gap.txt` next to each result.
+
+**Engine accuracy** (top bar) shows the totals: the score drop between our prediction and real Serum, the biggest causes across all runs, the features with the largest drop, the average band differences and the corrections in use. **Export report** saves it all as one JSON file to send in for engine fixes; **Reset corrections** forgets the learned corrections.
 
 ### Running jobs
 
@@ -157,7 +170,7 @@ Any Serum 2 preset can be imported and re-exported unchanged; settings that aren
 
 **Limits**
 - Factory samples, multisamples, noises and IRs are rendered only when Serum's content folder is installed (`/Library/Audio/Presets/Xfer Records/Serum 2 Presets`). User samples are embedded in the preset.
-- The reconstruction builds its oscillators from **custom wavetables** (as required); the other oscillator types are used when importing presets.
+- The reconstruction starts from **custom wavetables** and also tries sample, granular and spectral oscillators built from a note of the original; multisample oscillators are used only when importing presets.
 - The arpeggiator's Pattern mode is approximated.
 - Some modulation source IDs (aftertouch, poly aftertouch, random, alternate, pitch bend) are inferred, not confirmed against Serum.
 

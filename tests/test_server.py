@@ -61,7 +61,8 @@ def test_full_flow(monkeypatch):
     assert len(a.json()["notes"]) >= 1
     rr = c.post(f"/api/projects/{pid}/reconstruct",
                 json={"stem": "bass", "start": 0.0, "end": 1.9, "time_budget": 15, "verify_serum": True,
-                      "serum_tune": True, "serum_tune_minutes": 0.25})
+                      "serum_tune": True, "serum_tune_minutes": 0.25, "learn": True,
+                      "learn_minutes": 0.5})
     j = _wait(c, rr.json()["job"], timeout=300)
     assert j["status"] == "done", j.get("error")
     res = j["result"]
@@ -71,6 +72,13 @@ def test_full_flow(monkeypatch):
     assert res["serum_tune"]["ok"] and res["serum_tune"]["evals"] > 5, res["serum_tune"]
     assert res["serum_tune"]["after"] >= res["serum_tune"]["before"]
     assert res["serum"]["ok"], res["serum"]
+    # learning from Serum: engine gap documented, culprits searched, nothing audio in the log
+    eg = res["engine_gap"]
+    assert eg and isinstance(eg["findings"], list) and "components" in eg["culprits"], eg
+    assert "engine_gap.txt" in res["files"]
+    s = c.get("/api/calibration").json()
+    assert s["runs"] >= 1
+    assert c.get("/api/calibration/export").status_code == 200
     f = c.get(f"/api/projects/{pid}/results/{res['id']}/file/notes.mid")
     assert f.status_code == 200
 

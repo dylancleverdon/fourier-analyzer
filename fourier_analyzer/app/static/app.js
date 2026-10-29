@@ -7,6 +7,7 @@ const api = async (path, opts = {}) => {
   return ct.includes("json") ? r.json() : r;
 };
 const post = (path, body) => api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;" })[c]);
 
 const state = { pid: null, meta: null, stem: null, peaks: null, duration: 0, sel: null, result: null, polling: {} };
 const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
@@ -617,6 +618,7 @@ $("#runRecon").onclick = async () => {
     target: parseFloat($("#target").value), time_budget: budgetSeconds(),
     keep_going: $("#keepGoing").checked, sidechain_in_preset: $("#scInPreset").checked,
     serum_tune: $("#serumTune").checked, serum_tune_minutes: parseFloat($("#serumTuneMin").value),
+    learn: $("#learnSerum").checked,
     verify_serum: $("#verifySerum").checked,
   };
   if (!body.start && state.duration > 12 && !confirm("No selection: the whole stem will be used (only the first 6 s drive the search). Continue?")) return;
@@ -652,6 +654,12 @@ function showResult(r) {
   $("#scInfo").textContent = !sc ? "" : sc.detected
     ? `Sidechain detected from the ${sc.source}: -${sc.depth_db} dB duck, attack ${sc.attack_ms} ms, hold ${sc.hold_ms} ms, release ${sc.release_ms} ms (${sc.kicks_used} kicks). It was removed before fitting and is re-applied when comparing. ${r.sidechain_logic || ""}`
     : `No sidechain ducking found (${sc.reason || ""}).`;
+  const eg = r.engine_gap;
+  $("#engineGap").innerHTML = eg
+    ? `<b>Our engine vs real Serum:</b> predicted ${fmt(eg.our_score, 1)}%, Serum scored ${fmt(eg.serum_score, 1)}%`
+      + (eg.engine_similarity ? ` · the two renders are ${fmt(eg.engine_similarity.spectral_similarity, 1)}% alike` : "")
+      + (eg.findings && eg.findings.length ? `<ul>${eg.findings.slice(0, 8).map((f) => `<li>${esc(f)}</li>`).join("")}</ul>` : "")
+    : "";
   $("#serumScore").textContent = r.serum && r.serum.ok ? `Real Serum 2 render: waveform similarity ${fmt(r.serum.score, 1)}%, spectral ${fmt(r.serum.details.spectral_similarity, 1)}%` : `Serum 2 check: ${r.serum ? r.serum.error : "not run"}`;
   const base = `/api/projects/${state.pid}/results/${r.id}/file/`;
   $("#aTarget").src = base + "target.wav";
@@ -741,6 +749,22 @@ $("#newWinBtn").onclick = openNewWindow;
 document.addEventListener("keydown", (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "n") { e.preventDefault(); openNewWindow(); }
 });
+
+// ------------------------------------------------------------------ engine accuracy
+async function showEngine() {
+  const s = await api("/api/calibration");
+  const body = $("#engineBody");
+  if (!s.runs) { body.innerHTML = "<p>No runs verified in Serum 2 yet. Reconstruct a sound with <b>learn from Serum</b> ticked.</p>"; return; }
+  const rows = (arr, cols) => `<table class="small"><tr>${cols.map((c) => `<th>${c[0]}</th>`).join("")}</tr>${arr.map((x) => `<tr>${cols.map((c) => `<td>${esc(String(c[1](x)))}</td>`).join("")}</tr>`).join("")}</table>`;
+  body.innerHTML = `<p><b>${s.runs}</b> runs logged. On average real Serum scores <b>${fmt(s.avg_drop, 2)}</b> points ${s.avg_drop >= 0 ? "below" : "above"} our prediction; our renders and Serum's are ${fmt(s.avg_engine_similarity, 1)}% alike.</p>`
+    + `<h4>Biggest causes (switching the part off closes the gap by)</h4>` + (s.culprits.length ? rows(s.culprits.slice(0, 10), [["Part", (x) => x.component], ["Runs", (x) => x.runs], ["Avg. gap explained", (x) => fmt(x.avg_explains, 2) + " %"]]) : "<p class='muted small'>none yet</p>")
+    + `<h4>Features with the largest score drop</h4>` + rows(s.features.slice(0, 10), [["Feature", (x) => x.feature], ["Runs", (x) => x.runs], ["Avg. drop", (x) => fmt(x.avg_drop, 2)]])
+    + `<h4>Frequency bands (Serum minus ours, average)</h4>` + rows(s.bands.filter((b) => Math.abs(b.avg_diff_db) >= 1), [["Band", (x) => x.hz + " Hz"], ["Diff.", (x) => fmt(x.avg_diff_db, 1) + " dB"], ["Runs", (x) => x.runs]])
+    + `<h4>Corrections applied to presets</h4>` + (s.corrections.length ? rows(s.corrections, [["Parameter", (x) => x.key], ["Correction", (x) => x.kind === "ratio" ? "×" + fmt(x.value, 3) : (x.value >= 0 ? "+" : "") + fmt(x.value, 4)], ["From runs", (x) => x.runs]]) : "<p class='muted small'>none yet (a parameter needs 5 runs that agree)</p>")
+    + `<h4>Recent runs</h4>` + s.recent.map((r) => `<p class="small"><b>${esc(r.name || "")}</b>: ours ${fmt(r.our_score, 1)}%, Serum ${fmt(r.serum_score, 1)}%<br>${r.findings.map(esc).join("<br>")}</p>`).join("");
+}
+$("#engineBtn").onclick = () => { $("#engineDlg").showModal(); showEngine().catch((e) => ($("#engineBody").textContent = String(e))); };
+$("#engineReset").onclick = async () => { if (confirm("Forget every learned correction? (The log of past runs is kept.)")) { await post("/api/calibration/reset", {}); showEngine(); } };
 
 $("#settingsBtn").onclick = async () => {
   const s = await api("/api/system");

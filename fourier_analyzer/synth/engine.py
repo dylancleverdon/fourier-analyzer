@@ -327,8 +327,11 @@ def distort(x, mode, drive, mix):
 
 
 def ott(x, depth, amount, sr):
+    """OTT slot = the multiband compressor module it is written to Serum as
+    (same defaults, so the preset sounds like the render)."""
     from .dsp import comp_fx
-    return comp_fx(x, {"multiband": True, "depth": depth, "amount": amount}, sr)
+    from .patch import fx
+    return comp_fx(x, fx("comp", multiband=True, depth=depth, amount=amount), sr)
 
 
 def shelf(x, freq, gain_db, sr, high=False):

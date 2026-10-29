@@ -383,6 +383,8 @@ def _fx_to_serum(m: dict, sc: dict, bpm: float) -> tuple[dict, dict]:
         pp["kParamReso2"] = float(100 * math.sqrt(max(d["q2"] - 0.3, 0) / 3))
     elif kind == "filter":
         pp["kParamType"] = LEGACY_FILTERS.get(d["ftype"], d["ftype"])
+        if d["ftype"] in LEGACY_FILTERS:
+            pp["kParamVar"] = 0.0                  # plain SVF: no FAT, as rendered
         pp["kParamFreq"] = cutoff_to_norm(float(np.mean(d["cutoff"])), sc)
         if d.get("pan"):
             pp["kParamStereo"] = float(50 + 50 * d["pan"])
@@ -1110,7 +1112,9 @@ def patch_to_state(patch: Patch, bank: TableBank | None = None, samples=None) ->
                 fpp["kParamDrive"] = float(f.drive * 100)
             if f.keytrack:
                 fpp["kParamKeyTrack"] = 1.0
-            if f.var != 0.5:
+            if f.type in LEGACY_FILTERS:
+                fpp["kParamVar"] = 0.0             # plain SVF: no FAT (our lp24 etc. render without it)
+            elif f.var != 0.5:
                 fpp["kParamVar"] = float(f.var * 100)
             if f.mix < 1:
                 fpp["kParamWet"] = float(f.mix * 100)

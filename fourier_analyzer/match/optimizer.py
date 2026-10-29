@@ -33,8 +33,9 @@ import numpy as np
 
 from ..analysis.features import Analysis
 from ..synth.engine import Renderer
-from ..synth.patch import (fx as fx_module, LFO, Distortion, EQ, Env, Filter, Mod, NoiseOsc, OTT, Osc, Patch,
-                           SubOsc)
+from ..synth.patch import (fx as fx_module, LFO, Distortion, EQ, Env, Filter, GranularCfg, Mod, NoiseOsc, OTT,
+                           Osc, Patch, SampleCfg, SpectralCfg, SubOsc)
+from ..synth.samples import SampleBank
 from ..synth.wavetables import StockIndex, TableBank, custom_table_from_harmonics
 from . import params as P
 from .metrics import Reference
@@ -74,13 +75,15 @@ class Result:
     history: list = field(default_factory=list)
     used_custom: bool = False
     stages: list = field(default_factory=list)
+    samples: SampleBank | None = None
 
 
 class Optimizer:
     def __init__(self, y: np.ndarray, sr: int, analysis: Analysis, options: Options | None = None,
                  bank: TableBank | None = None, stock: StockIndex | None = None,
                  progress: Callable[..., None] | None = None,
-                 context_gain: np.ndarray | None = None):
+                 context_gain: np.ndarray | None = None, samples: SampleBank | None = None,
+                 source_audio: tuple[np.ndarray, int] | None = None):
         self.opts = options or Options()
         self.analysis = analysis
         self.bank = bank or TableBank()
@@ -100,7 +103,12 @@ class Optimizer:
             self.gain = np.pad(g, (0, n - len(g)), constant_values=1.0)
         else:
             self.gain = None
-        self.renderer = Renderer(self.bank, OPT_SR)
+        self.samples = samples if samples is not None else SampleBank()
+        # full-rate audio for the sample / granular / spectral oscillators
+        self.source_audio = source_audio or (self.full_y, OPT_SR)
+        self._source_sid: str | None = None
+        self._source_root = 60.0
+        self.renderer = Renderer(self.bank, OPT_SR, samples=self.samples)
         self.notes = [nt for nt in analysis.notes if nt.start < self.duration]
         self.t0 = time.time()
         self.best_score = -1.0
@@ -538,7 +546,70 @@ class Optimizer:
                 q.glide = 0.03
                 return q
             mv("glide/portamento", f, {"glide"})
+        self._sample_moves(p, mv)
         return moves
+
+    # ------------------------------------------------------------------
+    def source_sample(self) -> tuple[str | None, float]:
+        """One note of the original, embedded as a sample (with the sidechain
+        ducking divided out): the source for sample / granular / spectral
+        oscillators. Returns (sample id, root note)."""
+        if self._source_sid is not None or not self.notes:
+            return self._source_sid, self._source_root
+        y, sr = self.source_audio
+        notes = sorted(self.notes, key=lambda n: n.start)
+        # the longest note, ending before the next one starts (plus a short tail)
+        best = max(range(len(notes)), key=lambda k: notes[k].duration)
+        n = notes[best]
+        nxt = notes[best + 1].start if best + 1 < len(notes) else len(y) / sr
+        a = max(0.0, n.start - 0.003)
+        b = min(nxt, n.start + n.duration + 0.25, len(y) / sr)
+        seg = np.asarray(y[int(a * sr): int(b * sr)], dtype=np.float64)
+        if self.gain is not None and len(seg):
+            t = a + np.arange(len(seg)) / sr
+            g = np.interp(t, np.arange(len(self.gain)) / OPT_SR, self.gain)
+            seg = seg / np.maximum(g, 0.1)
+        if len(seg) < int(0.03 * sr):
+            self._source_sid = ""
+            return "", 60.0
+        fade = min(len(seg) // 4, int(0.01 * sr))
+        seg[-fade:] *= np.linspace(1.0, 0.0, fade)
+        seg = seg / max(1e-9, float(np.max(np.abs(seg))))
+        self._source_root = float(n.pitch)
+        self._source_sid = self.samples.add(seg.astype(np.float32), sr, root=self._source_root,
+                                            name="Fourier Analyzer source")
+        return self._source_sid, self._source_root
+
+    def _sample_moves(self, p: Patch, mv) -> None:
+        """Sample, granular and spectral oscillators playing a note of the
+        original: in place of osc A, or as an extra layer."""
+        if any(o.enabled and o.type != "wavetable" for o in p.oscs):
+            return
+        sid, root = self.source_sample()
+        if not sid:
+            return
+        free = next((i for i in (1, 2) if not p.oscs[i].enabled), None)
+
+        def make(kind: str, level: float) -> Osc:
+            o = Osc(enabled=True, type=kind, level=level, table="basic:sine")
+            o.smp = SampleCfg(source=sid, root=root, loop="forward" if kind == "sample" else "off",
+                              loop_start=0.4, loop_end=0.95, crossfade=0.3)
+            if kind == "granular":
+                o.gran = GranularCfg(density=40.0, length=0.08, rand_offset=0.05)
+            if kind == "spectral":
+                o.spec = SpectralCfg()
+            return o
+        for kind in ("sample", "granular", "spectral"):
+            def f(q, kind=kind):
+                lvl = q.oscs[0].level
+                q.oscs[0] = make(kind, lvl)
+                return q
+            mv(f"osc A as {kind} oscillator (a note of the original)", f, {"osc"})
+            if free is not None:
+                def g(q, kind=kind):
+                    q.oscs[free] = make(kind, 0.35)
+                    return q
+                mv(f"{kind} layer on osc {'ABC'[free]} (a note of the original)", g, {"osc"})
 
     def prune_moves(self, p: Patch):
         moves = []
@@ -712,7 +783,7 @@ class Optimizer:
         metrics = self.ref.all(self.render(p))
         total = metrics["waveform_similarity"]
         return Result(patch=p, score=total, details=metrics, notes=self.analysis.notes, bank=self.bank,
-                      history=self.history, used_custom=True, stages=self.stages)
+                      history=self.history, used_custom=True, stages=self.stages, samples=self.samples)
 
     def _explore(self, p: Patch, score: float) -> tuple[Patch, float]:
         """Extra time beyond the standard schedule: repeated rounds of structure

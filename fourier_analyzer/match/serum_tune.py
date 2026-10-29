@@ -31,11 +31,14 @@ def objective(d: dict) -> float:
 def tune_in_serum(patch: Patch, bank, notes, y_target: np.ndarray, sr: int, budget_s: float,
                   gain: np.ndarray | None = None, stop: Callable[[], bool] | None = None,
                   progress: Callable[[str, float, float, dict], None] | None = None,
-                  session_factory=SerumSession, sigma: float = 0.06) -> tuple[Patch, dict]:
+                  session_factory=SerumSession, sigma: float = 0.06, samples=None) -> tuple[Patch, dict]:
     """Return (best patch, info). Never worse than the input: the starting
     patch is kept unless a candidate scores higher in real Serum. Raises
     SerumHostError only if Serum cannot render the starting patch."""
     import cma
+
+    from .. import calibration
+    corr = calibration.load_corrections()          # learned export corrections
     t0 = time.time()
     ref = Reference(np.asarray(y_target, dtype=np.float64), sr)
     duration = len(y_target) / sr
@@ -46,7 +49,8 @@ def tune_in_serum(patch: Patch, bank, notes, y_target: np.ndarray, sr: int, budg
 
     with session_factory(sr) as sess:
         def score(p: Patch) -> tuple[float, dict]:
-            y = sess.render(build_preset_bytes(p, bank, name="FA tuning"), notes, duration)
+            y = sess.render(build_preset_bytes(calibration.apply_corrections(p, corr), bank, name="FA tuning",
+                                                samples=samples), notes, duration)
             y = np.asarray(y, dtype=np.float64)[: len(y_target)]
             if len(y) < len(y_target):
                 y = np.pad(y, (0, len(y_target) - len(y)))
@@ -107,5 +111,6 @@ def tune_in_serum(patch: Patch, bank, notes, y_target: np.ndarray, sr: int, budg
                 info["error"] = str(e)
     info.update({"after": round(best_d["waveform_similarity"], 2), "evals": evals,
                  "seconds": round(time.time() - t0, 1), "details": best_d,
-                 "params": len(ps), "stopped": bool(stopped())})
+                 "params": len(ps), "stopped": bool(stopped()),
+                 "changes": calibration.tuning_changes(patch, best_p) if best_p is not patch else []})
     return best_p, info

@@ -41,7 +41,8 @@ def _stft_mag(y: np.ndarray) -> np.ndarray:
 
 
 def best_lag(a: np.ndarray, b: np.ndarray, max_lag: int) -> tuple[int, float]:
-    """Lag (samples, positive = b delayed) maximising Pearson r, and that r."""
+    """Shift for b (as applied by ``_shift``) that maximises the Pearson r with a,
+    and that r. Negative when b is late."""
     n = len(a)
     a0 = a - a.mean()
     b0 = b - b.mean()

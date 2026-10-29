@@ -484,18 +484,20 @@ class FakeSerumHost:
         self.patch = None
 
     def load_preset(self, preset: bytes) -> None:
+        from ..synth.samples import SampleBank
         from ..synth.wavetables import TableBank
         from .mapping import state_to_patch
         from .preset import read_preset_bytes
         _, st = read_preset_bytes(preset)
         self.bank = TableBank()
-        self.patch = state_to_patch(st, self.bank)
+        self.samples = SampleBank()
+        self.patch = state_to_patch(st, self.bank, samples=self.samples)
         for f in (self.patch.filter, self.patch.filter2):
             f.cutoff = float(np.clip(f.cutoff * self.cutoff_scale, 20.0, 20000.0))
 
     def render(self, notes, duration: float) -> np.ndarray:
         from ..synth.engine import Renderer
-        return Renderer(self.bank, self.sr).render(self.patch, notes, duration).astype(np.float32)
+        return Renderer(self.bank, self.sr, samples=self.samples).render(self.patch, notes, duration).astype(np.float32)
 
 
 def _make_host(sr: int):
@@ -743,10 +745,12 @@ def verify(preset: bytes, notes, y_target: np.ndarray, sr: int, gain=None) -> di
         if not np.any(np.abs(y) > 1e-5):
             return {"ok": False, "error": "Serum rendered silence (preset not accepted?)"}
         from ..match.metrics import Reference
+        raw = y
         if gain is not None:
             y = y[: len(gain)] * gain[: len(y)]
         d = Reference(np.asarray(y_target, dtype=np.float64), sr).all(y)
-        return {"ok": True, "score": d["waveform_similarity"], "details": d, "audio": y, "plugin": plugin}
+        return {"ok": True, "score": d["waveform_similarity"], "details": d, "audio": y, "raw_audio": raw,
+                "plugin": plugin}
     except Exception as e:
         log.warning("Serum verification unavailable: %s", e)
         return {"ok": False, "error": str(e)}

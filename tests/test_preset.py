@@ -90,3 +90,48 @@ def test_full_feature_roundtrip():
                                                      ("macro2", "fx.1.mix")}
     y = Renderer(bank, 22050).render(q, [Note(0, 0.4, 36), Note(0.5, 0.4, 43)], 1.2)
     assert np.all(np.isfinite(y)) and np.abs(y).max() > 1e-3
+
+
+def test_every_search_move_sounds_the_same_after_export():
+    """What the search hears must be what the preset tells Serum: every
+    structure move survives patch -> .SerumPreset -> patch with the same sound."""
+    import numpy as np
+    from fourier_analyzer.analysis.features import analyze
+    from fourier_analyzer.match.metrics import Reference
+    from fourier_analyzer.match.optimizer import OPT_SR, Optimizer, Options
+    from fourier_analyzer.serum.mapping import build_preset_bytes, state_to_patch
+    from fourier_analyzer.serum.preset import read_preset_bytes
+    from fourier_analyzer.synth.engine import Renderer
+    from fourier_analyzer.synth.patch import Filter, Note, Osc, Patch
+    from fourier_analyzer.synth.samples import SampleBank
+    from fourier_analyzer.synth.wavetables import TableBank
+    p0 = Patch()
+    p0.oscs[0] = Osc(enabled=True, table="basic:saw")
+    p0.filter = Filter(enabled=True, type="lp24", cutoff=1500, reso=0.2)
+    notes = [Note(0, 0.4, 45), Note(0.5, 0.4, 52), Note(1.0, 0.5, 48)]
+    y = Renderer(sr=OPT_SR).render(p0, notes, 1.6)
+    opt = Optimizer(y, OPT_SR, analyze(y, OPT_SR, bpm=128), Options(time_budget=5))
+    base = opt.initial_patch()
+    base.filter = Filter(enabled=True, type="lp24", cutoff=1500, reso=0.2)
+    bad, seen = [], set()
+    for _ in range(2):
+        for name, fn, _f in opt.structure_moves(base):
+            if name in seen:
+                continue
+            seen.add(name)
+            q = fn(base.copy())
+            _, st = read_preset_bytes(build_preset_bytes(q, opt.bank, samples=opt.samples))
+            b2, s2 = TableBank(), SampleBank()
+            r = state_to_patch(st, b2, samples=s2, bpm=128)
+            ya = Renderer(opt.bank, OPT_SR, samples=opt.samples).render(q, notes, 1.6)
+            yb = Renderer(b2, OPT_SR, samples=s2).render(r, notes, 1.6)
+            if not np.any(ya):
+                continue
+            lv = 20 * np.log10((np.sqrt(np.mean(yb ** 2)) + 1e-12) / np.sqrt(np.mean(ya ** 2)))
+            if Reference(ya, OPT_SR).spectral(yb) < 99.5 or abs(lv) > 0.3:
+                bad.append((name, round(lv, 2)))
+        base = base.copy()                     # moves that need unison and osc B
+        base.oscs[0].unison = 3
+        base.oscs[1] = Osc(enabled=True, table="basic:square", level=0.4)
+    assert len(seen) > 60
+    assert not bad, bad
