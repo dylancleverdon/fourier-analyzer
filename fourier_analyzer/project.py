@@ -60,10 +60,23 @@ class Job:
                 "log": self.log[-300:], "result": self.result, "error": self.error}
 
 
+def parallel_jobs() -> int:
+    """How many jobs may run at the same time (setting ``parallel_jobs``)."""
+    import os
+    try:
+        n = int(config.settings().get("parallel_jobs", 0))
+    except (TypeError, ValueError):
+        n = 0
+    if n <= 0:
+        n = max(2, min(4, (os.cpu_count() or 4) // 3))
+    return n
+
+
 class JobManager:
     def __init__(self):
         self.jobs: dict[str, Job] = {}
-        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fa-job")
+        # several jobs at once so separate windows can each process a track
+        self.pool = ThreadPoolExecutor(max_workers=parallel_jobs(), thread_name_prefix="fa-job")
         self.lock = threading.Lock()
 
     def submit(self, kind: str, fn, project: str | None = None) -> Job:

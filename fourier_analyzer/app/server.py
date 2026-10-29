@@ -8,7 +8,7 @@ import threading
 from pathlib import Path
 
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -84,6 +84,23 @@ def pick_folder(body: PickIn):
         return {"path": res[0]} if res else {"cancelled": True}
     except Exception as e:
         raise HTTPException(501, f"no folder dialog available: {e}")
+
+
+@app.post("/api/window/new")
+def new_window(request: Request):
+    """Open another analyzer window on the same server (each window works on
+    its own project; their jobs run in parallel)."""
+    url = str(request.base_url)
+    try:
+        import webview
+        if not webview.windows:
+            raise RuntimeError("no native window")
+        n = len(webview.windows) + 1
+        webview.create_window(f"Fourier Analyzer {config.version()} ({n})", url, width=1360, height=900,
+                              min_size=(900, 600))
+        return {"opened": True, "windows": n}
+    except Exception:
+        return {"opened": False, "url": url}     # browser mode: the page opens a tab
 
 
 @app.get("/api/diagnostics")

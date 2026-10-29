@@ -656,6 +656,18 @@ function pollJob(jid, done) {
 }
 
 // ------------------------------------------------------------------ settings
+// ------------------------------------------------------------------ windows
+async function openNewWindow() {
+  try {
+    const r = await (await fetch("/api/window/new", { method: "POST" })).json();
+    if (!r.opened) window.open(r.url || "/", "_blank");
+  } catch (e) { window.open("/", "_blank"); }
+}
+$("#newWinBtn").onclick = openNewWindow;
+document.addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "n") { e.preventDefault(); openNewWindow(); }
+});
+
 $("#settingsBtn").onclick = async () => {
   const s = await api("/api/system");
   kv($("#sysInfo"), [["version", s.version], ["ML separation", s.ml_separation ? "installed" : "missing (DSP fallback)"], ["Serum host (pedalboard)", s.pedalboard ? "available" : "missing"], ["Serum plugin", s.serum_plugin || "not found"], ["Serum tables", s.serum_tables || "not found"], ["exports", s.exports]]);
