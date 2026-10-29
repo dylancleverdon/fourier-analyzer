@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import logging
 import plistlib
+import re
 import struct
 from pathlib import Path
 
@@ -107,7 +108,72 @@ def _swap_payload(blob: bytes, preset: bytes) -> bytes | None:
     return None
 
 
-def describe_blob(blob: bytes) -> str:
+# ----------------------------------------------------------------------------
+# JUCE state wrapper: b"VC2!" + uint32 length + UTF-8 XML + NUL. Binary blobs
+# inside the XML (e.g. <IComponent> of a VST3) use JUCE's own base64:
+# "<numBytes>." followed by 6-bit groups read LSB-first from the bytes, with
+# the alphabet below (MemoryBlock::toBase64Encoding).
+JUCE_B64 = ".ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+"
+_JUCE_IDX = {c: i for i, c in enumerate(JUCE_B64)}
+_JUCE_TEXT = re.compile(r">(\d+\.[.A-Za-z0-9+]+)<")
+
+
+def juce_b64_encode(data: bytes) -> str:
+    n = len(data)
+    nchars = ((n << 3) + 5) // 6
+    bits = np.unpackbits(np.frombuffer(data, dtype=np.uint8), bitorder="little")
+    bits = np.concatenate([bits, np.zeros(nchars * 6 - len(bits), dtype=np.uint8)])
+    vals = bits.reshape(-1, 6).astype(np.int64) @ (1 << np.arange(6))
+    return f"{n}." + "".join(JUCE_B64[v] for v in vals)
+
+
+def juce_b64_decode(text: str) -> bytes:
+    num, _, body = text.strip().partition(".")
+    n = int(num)
+    vals = np.array([_JUCE_IDX[c] for c in body], dtype=np.uint8)
+    bits = ((vals[:, None] >> np.arange(6)) & 1).astype(np.uint8).ravel()
+    out = np.packbits(bits, bitorder="little").tobytes()
+    return (out + b"\0" * n)[:n]
+
+
+def _vc2_xml(blob: bytes) -> str | None:
+    if blob[:4] != b"VC2!" or len(blob) < 8:
+        return None
+    (n,) = struct.unpack_from("<I", blob, 4)
+    return blob[8:8 + n].decode("utf-8", errors="strict")
+
+
+def _vc2_wrap(xml: str) -> bytes:
+    b = xml.encode("utf-8")
+    return b"VC2!" + struct.pack("<I", len(b)) + b + b"\0"
+
+
+def _swap_vc2(blob: bytes, preset: bytes) -> bytes | None:
+    """Swap the preset inside the first JUCE-base64 blob of a VC2! XML state
+    that contains Serum's data."""
+    xml = _vc2_xml(blob)
+    if xml is None:
+        return None
+    done = False
+
+    def repl(m):
+        nonlocal done
+        if done:
+            return m.group(0)
+        try:
+            inner = juce_b64_decode(m.group(1))
+        except Exception:
+            return m.group(0)
+        new_inner = _swap_in_state(inner, preset)
+        if new_inner is None:
+            return m.group(0)
+        done = True
+        return ">" + juce_b64_encode(new_inner) + "<"
+    new_xml = _JUCE_TEXT.sub(repl, xml)
+    return _vc2_wrap(new_xml) if done else None
+
+
+def describe_blob(blob: bytes, depth: int = 0) -> str:
     """Short structural summary of an unknown plugin state (for diagnostics)."""
     parts = [f"{len(blob)} bytes", "head " + blob[:24].hex()]
     if blob.find(MAGIC) >= 0:
@@ -116,6 +182,15 @@ def describe_blob(blob: bytes) -> str:
         parts.append(f"zstd@{k} {used}->{len(raw)}B head {raw[:8].hex()}")
     if blob[:6] == b"bplist" or blob[:5] == b"<?xml":
         parts.append("plist")
+    xml = _vc2_xml(blob) if depth < 2 else None
+    if xml:
+        tags = re.findall(r"<([A-Za-z_][\w.-]*)", xml)
+        parts.append("VC2 xml tags " + ",".join(dict.fromkeys(tags)))
+        for m in _JUCE_TEXT.finditer(xml):
+            try:
+                parts.append("[inner " + describe_blob(juce_b64_decode(m.group(1)), depth + 1) + "]")
+            except Exception as e:
+                parts.append(f"[inner undecodable: {e}]")
     return "; ".join(parts)
 
 
@@ -139,7 +214,9 @@ def _swap(blob: bytes, preset: bytes) -> bytes | None:
 
 
 def _swap_in_state(state: bytes, preset: bytes) -> bytes | None:
-    """Handle raw blobs, AU plists and base64-in-plist variants."""
+    """Handle raw blobs, JUCE VC2! XML states, AU plists and base64-in-plist."""
+    if state[:4] == b"VC2!":
+        return _swap_vc2(state, preset)
     direct = _swap(state, preset)
     if direct is not None:
         return direct
