@@ -56,6 +56,8 @@ class SerumJudge:
         # how a render is scored: set by the optimizer to its own search
         # measure, so Serum and our engine are judged by the same yardstick
         self.scorer: Callable[[np.ndarray], float] | None = None
+        self.last_audio: np.ndarray | None = None      # Serum's most recent render (sidechain applied)
+        self._audio_key: bytes | None = None
 
     # ------------------------------------------------------------------
     def available(self) -> bool:
@@ -88,14 +90,15 @@ class SerumJudge:
                 pass
             self.session = None
 
-    def score(self, patch: Patch) -> tuple[float, dict] | None:
+    def score(self, patch: Patch, want_audio: bool = False) -> tuple[float, dict] | None:
         """(objective, metrics) of the patch rendered in real Serum, or None
-        when Serum is not available or its time is used up."""
+        when Serum is not available or its time is used up. ``want_audio``:
+        also keep Serum's render in ``last_audio`` (re-rendered if needed)."""
         import hashlib
         preset = build_preset_bytes(self._apply(patch, self.corr), self.bank, name="FA structure",
                                     samples=self.samples)
         key = hashlib.sha1(preset).digest()
-        if key in self._cache:
+        if key in self._cache and (not want_audio or key == self._audio_key):
             return self._cache[key]
         if not self.available() or not self._open():
             return None
@@ -115,6 +118,7 @@ class SerumJudge:
             y = np.pad(y, (0, len(self.y) - len(y)))
         if self.gain is not None:
             y = y * self.gain[: len(y)]
+        self.last_audio, self._audio_key = y, key
         if not np.any(np.abs(y) > 1e-6):
             out = (0.0, {"waveform_similarity": 0.0, "spectral_similarity": 0.0})
         else:

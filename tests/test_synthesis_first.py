@@ -147,9 +147,37 @@ def test_checkpoints_tune_up_in_serum_when_it_lags():
     p.filter = Filter(enabled=True, type="lp24", cutoff=900, reso=0.2)
     q, s = opt.checkpoint(p, opt.evaluate(p), "test")
     row = opt.checkpoints[-1]
-    assert row["at"] == "test" and "serum" in row
-    if row["lag"] > opt.CHECKPOINT_LAG:
+    assert row["at"] == "test" and "serum" in row and row["lag"] > opt.CHECKPOINT_LAG
+    # our engine learned that this "Serum" is brighter, so it now predicts Serum's score ...
+    assert opt.ecorr.v["cutoff"] > 1.3 or opt.ecorr.v["tilt"] > 0.4, opt.ecorr.as_dict()
+    assert "engine_corrected" in row and abs(row["engine_corrected"] - row["serum"]) < row["lag"]
+    # ... and a tune-up inside Serum runs only if it still lags after that
+    if row["engine_corrected"] - row["serum"] > opt.CHECKPOINT_LAG:
         assert "tuned" in row
+
+
+def test_a_wrong_engine_correction_is_dropped():
+    from fourier_analyzer.match.engine_correction import EngineCorrection
+    from fourier_analyzer.match.serum_judge import SerumJudge
+
+    class Same(_Sess):                       # a "Serum" identical to our engine
+        def render(self, preset, notes, duration):
+            from fourier_analyzer.serum.mapping import state_to_patch
+            from fourier_analyzer.serum.preset import read_preset_bytes
+            from fourier_analyzer.synth.samples import SampleBank
+            from fourier_analyzer.synth.wavetables import TableBank
+            _, st = read_preset_bytes(preset)
+            b, s = TableBank(), SampleBank()
+            return Renderer(b, self.sr, samples=s).render(state_to_patch(st, b, samples=s), notes, duration)
+    opt = _opt()
+    opt.ecorr = EngineCorrection({"cutoff": 0.5, "level_db": 4.0})
+    y44 = Renderer(sr=44100).render(_patch_target(), opt.notes, opt.duration)
+    opt.judge = SerumJudge(opt.bank, opt.samples, opt.notes, y44, 44100, budget_s=120, session_factory=Same)
+    p = opt.initial_patch()
+    p.filter = Filter(enabled=True, type="lp24", cutoff=900, reso=0.2)
+    opt.checkpoint(p, opt.evaluate(p), "wrong start")
+    log = opt.ecorr_log[-1]
+    assert "dropped" in log or abs(opt.ecorr.v["cutoff"] - 1.0) < 0.3, log
 
 
 def _patch_target():
@@ -183,3 +211,17 @@ def test_fix_first_ranks_emulations_by_disagreement():
     ff = calibration.summary()["fix_first"]
     assert ff[0]["emulation"] == "FX hyperdim"
     assert {"warp BendPos"} <= {x["emulation"] for x in ff}
+
+
+def test_engine_corrections_that_held_up_start_the_next_run():
+    from fourier_analyzer.match import engine_correction as EC
+    EC.reset_saved()
+    EC.save_run(EC.EngineCorrection({"cutoff": 1.4}), helped=False)
+    assert EC.load_saved().is_identity()                      # not validated: not saved
+    EC.save_run(EC.EngineCorrection({"cutoff": 1.4, "tilt": 0.6}), helped=True)
+    EC.save_run(EC.EngineCorrection({"cutoff": 1.2, "tilt": 0.2}), helped=True)
+    v = EC.load_saved().v
+    assert 1.2 < v["cutoff"] < 1.4 and abs(v["tilt"] - 0.4) < 1e-6
+    assert _opt().ecorr.v["cutoff"] == v["cutoff"]           # a new run starts from it
+    assert _opt(engine_learning=False).ecorr.is_identity()
+    EC.reset_saved()

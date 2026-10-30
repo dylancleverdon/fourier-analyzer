@@ -135,40 +135,69 @@
 
         <div class="tabpane" id="tab-recon" hidden>
           <div class="recon-opts">
-            <div class="opt">
-              <label>Stop early at waveform similarity <b id="targetVal">90</b>%</label>
-              <input id="target" type="range" min="50" max="99" value="90">
-              <div class="muted small">Always uses custom wavetables built from the sound. The search stops once the waveforms correlate this well (or the time runs out).</div>
-            </div>
-            <div class="opt">
-              <label>Search time</label>
-              <select id="budget"><option value="90">1.5 min</option><option value="240" selected>4 min</option><option value="480">8 min</option><option value="900">15 min</option><option value="1800">30 min</option><option value="3600">1 hour</option><option value="7200">2 hours</option><option value="14400">4 hours</option><option value="28800">8 hours</option><option value="custom">Custom…</option><option value="0">Until I stop it</option></select>
-              <span id="budgetCustomWrap" hidden><input id="budgetCustom" type="number" min="1" step="1" value="60" style="width:6em"> min</span>
-              <div class="muted small">Runs over 15 min keep experimenting after the first full pass (new structures, filters, FX, restarts) and keep the best patch. Press Stop at any time to finish with the best one so far.</div>
-            </div>
-            <div class="opt checks">
-              <div class="pref"><span>Prefer synthesis</span><input id="preferSynth" type="range" min="0" max="100" value="50" title="How much sample, granular and spectral oscillators (and multi-frame wavetables) cost against their similarity. Warps, FM, filters, FX and routings never cost anything."><span>Prefer accuracy</span></div>
-              <div class="muted small">Samples are only tried once synthesis stops improving (or scores under 70) and must beat it by a margin; you get both presets.</div>
-              <label class="check"><input id="serumCheckpoints" type="checkbox" checked> check the best patch in real Serum 2 throughout the run, every
-                <select id="checkpointMin"><option value="1">1 min</option><option value="3" selected>3 min</option><option value="5">5 min</option><option value="10">10 min</option></select> and after every stage (tune-up in Serum if it lags)</label>
-              <label class="check"><input id="holdout" type="checkbox" checked> hold out the last note (or what's past the first 6 s) and score the patch on it too</label>
-              <label class="check"><input id="serumStructure" type="checkbox" checked> confirm structure in real Serum 2: the top
-                <input id="serumFinalists" type="number" min="1" max="12" step="1" value="3" style="width:3.5em"> candidates per round are rendered in Serum and a part is only kept if Serum agrees; Serum time
-                <select id="serumStructMin"><option value="2">2 min</option><option value="5" selected>5 min</option><option value="10">10 min</option><option value="20">20 min</option><option value="30">30 min</option><option value="60">1 hour</option></select></label>
-              <label class="check"><input id="serumOnly" type="checkbox"> <b>Serum only</b>: skip our engine and tune only inside real Serum 2 for the whole search time (slow; shows real Serum's speed)</label>
-              <label class="check"><input id="keepGoing" type="checkbox"> keep improving after reaching the target</label>
-              <label class="check"><input id="scInPreset" type="checkbox"> put detected sidechain ducking into the preset (LFO → Voice Amp)</label>
-              <label class="check"><input id="serumTune" type="checkbox" checked> fine-tune inside real Serum 2 for
-                <select id="serumTuneMin"><option value="2">2 min</option><option value="5" selected>5 min</option><option value="10">10 min</option><option value="20">20 min</option><option value="30">30 min</option><option value="60">1 hour</option></select></label>
-              <div class="muted small">After the search, the patch is rendered in the actual Serum 2 plugin again and again and nudged until it matches the original there too. Skipped if Serum 2 isn't installed.</div>
-              <label class="check"><input id="learnSerum" type="checkbox" checked> learn from Serum: compare our engine with real Serum 2, find what differs and correct future presets</label>
-              <label class="check"><input id="verifySerum" type="checkbox" checked> verify in real Serum 2</label>
-            </div>
-            <button id="runRecon" class="primary">Reconstruct</button>
+            <section class="optgroup">
+              <h4>Search</h4>
+              <div class="orow">
+                <label for="budget">Search time</label>
+                <div class="ctl">
+                  <select id="budget"><option value="90">1.5 min</option><option value="240" selected>4 min</option><option value="480">8 min</option><option value="900">15 min</option><option value="1800">30 min</option><option value="3600">1 hour</option><option value="7200">2 hours</option><option value="14400">4 hours</option><option value="28800">8 hours</option><option value="custom">Custom…</option><option value="0">Until I stop it</option></select>
+                  <span id="budgetCustomWrap" hidden><input id="budgetCustom" type="number" min="1" step="1" value="60"> min</span>
+                </div>
+              </div>
+              <p class="hint">Over 15 min it keeps experimenting after the first pass. Stop keeps the best patch so far.</p>
+              <div class="orow">
+                <label for="target">Stop at similarity</label>
+                <div class="ctl"><input id="target" type="range" min="50" max="99" value="90"><b class="val"><span id="targetVal">90</span>%</b></div>
+              </div>
+              <div class="orow sub"><label class="check"><input id="keepGoing" type="checkbox"> Keep improving after reaching it</label></div>
+              <div class="orow">
+                <label for="preferSynth">Build with</label>
+                <div class="ctl pref"><span>Synthesis</span><input id="preferSynth" type="range" min="0" max="100" value="50"><span>Accuracy</span></div>
+              </div>
+              <p class="hint">Warps, FM, filters and FX are free. Samples are tried only when synthesis stops improving; if one wins you also get a synthesis-only preset.</p>
+              <div class="orow"><label class="check"><input id="holdout" type="checkbox" checked> Test on a held-out note</label></div>
+              <p class="hint">The last note (or what's past 6 s) is kept out of the fit and scored at the end.</p>
+            </section>
+
+            <section class="optgroup" id="serumGroup">
+              <h4>Real Serum 2 <span id="serumStatus" class="status"></span></h4>
+              <div class="orow">
+                <label class="check"><input id="serumStructure" type="checkbox" checked> Confirm parts in Serum</label>
+                <div class="ctl" data-dep="serumStructure">top <input id="serumFinalists" type="number" min="1" max="12" step="1" value="3"> per round, up to
+                  <select id="serumStructMin"><option value="2">2 min</option><option value="5" selected>5 min</option><option value="10">10 min</option><option value="20">20 min</option><option value="30">30 min</option><option value="60">1 hour</option></select></div>
+              </div>
+              <p class="hint">A part is only kept if real Serum agrees it helps. More candidates = more accurate, slower.</p>
+              <div class="orow">
+                <label class="check"><input id="serumCheckpoints" type="checkbox" checked> Check during the run</label>
+                <div class="ctl" data-dep="serumCheckpoints">every <select id="checkpointMin"><option value="1">1 min</option><option value="3" selected>3 min</option><option value="5">5 min</option><option value="10">10 min</option></select></div>
+              </div>
+              <div class="orow sub" data-dep="serumCheckpoints"><label class="check"><input id="engineLearning" type="checkbox" checked> Correct our engine from each check</label></div>
+              <p class="hint">After every stage the best patch is played in Serum; our engine adjusts itself to sound like Serum, and the patch is tuned up in Serum if it still lags.</p>
+              <div class="orow">
+                <label class="check"><input id="serumTune" type="checkbox" checked> Fine-tune in Serum at the end</label>
+                <div class="ctl" data-dep="serumTune">for <select id="serumTuneMin"><option value="2">2 min</option><option value="5" selected>5 min</option><option value="10">10 min</option><option value="20">20 min</option><option value="30">30 min</option><option value="60">1 hour</option></select></div>
+              </div>
+              <div class="orow"><label class="check"><input id="verifySerum" type="checkbox" checked> Score the final preset in Serum</label></div>
+              <div class="orow"><label class="check"><input id="learnSerum" type="checkbox" checked> Learn from every run</label></div>
+              <p class="hint">Logs what differs between our engine and Serum and corrects future presets (Engine accuracy, top bar).</p>
+              <details class="adv">
+                <summary>Advanced</summary>
+                <div class="orow"><label class="check"><input id="serumOnly" type="checkbox"> Serum only</label></div>
+                <p class="hint">Skip tuning in our engine; every decision and all tuning happen in real Serum. Slow, but shows Serum's real speed.</p>
+              </details>
+              <p class="hint" id="serumMissing" hidden>Serum 2 wasn't found, so these steps are skipped. Set its location in Settings.</p>
+            </section>
+
+            <section class="optgroup">
+              <h4>Preset</h4>
+              <div class="orow"><label class="check"><input id="scInPreset" type="checkbox"> Put sidechain ducking in the preset</label></div>
+              <p class="hint">Adds an LFO → Voice Amp shaped like the detected ducking (otherwise it's added but switched off).</p>
+              <div class="go"><button id="runRecon" class="primary">Reconstruct</button></div>
+            </section>
           </div>
           <div id="result" hidden>
             <div class="score-row">
-              <div class="score"><div id="accVal" class="big">–</div><div class="muted">waveform similarity %</div></div>
+              <div class="score"><div id="accVal" class="big">–</div><div id="accLabel" class="muted">waveform similarity %</div><div id="accEngine" class="muted small"></div></div>
               <div class="score-detail">
                 <div id="accBadge" class="badge"></div>
                 <div id="accBars" class="bars"></div>

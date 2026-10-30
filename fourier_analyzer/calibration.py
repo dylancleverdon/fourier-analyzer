@@ -73,6 +73,8 @@ def save_corrections(c: dict) -> None:
 
 def reset_corrections() -> None:
     save_corrections({"params": {}, "pending": {}, "history": []})
+    from .match.engine_correction import reset_saved
+    reset_saved()                      # and what our engine learned during runs
 
 
 def checks_path() -> Path:
@@ -780,7 +782,12 @@ def summary() -> dict:
                          "avg_engine_delta": round(float(np.mean([c["engine_delta"] for c in v])), 2),
                          "avg_serum_delta": round(float(np.mean([c["serum_delta"] for c in v])), 2)}
                         for k, v in by_part.items()), key=lambda x: (-x["disagreed"], -x["checks"]))
+    try:
+        ec = json.loads((cal_dir() / "engine_correction.json").read_text())
+    except (OSError, ValueError):
+        ec = None
     return {
+        "engine_correction": ec,
         "fix_first": fix_first(recs),
         "structure_checks": structure[:30],
         "runs": len(recs),

@@ -449,6 +449,7 @@ class RegionIn(BaseModel):
     checkpoint_minutes: float = 3.0
     prefer_synthesis: float = 0.5       # 0 = prefer accuracy .. 1 = prefer synthesis over samples
     holdout: bool = True                # score the final patch on notes kept out of the fit
+    engine_learning: bool = True        # correct our engine from each Serum checkpoint during the run
     learn: bool = True                  # compare our engine with Serum, find causes, learn corrections
     learn_minutes: float = 3.0          # time for the culprit search
     verify_serum: bool = True

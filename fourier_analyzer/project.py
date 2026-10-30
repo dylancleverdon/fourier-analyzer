@@ -590,6 +590,7 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict, mode: str = "
                     prefer_synthesis=float(opts.get("prefer_synthesis", 0.5)),
                     checkpoint_minutes=float(opts.get("checkpoint_minutes") or 3.0),
                     holdout=bool(opts.get("holdout", True)),
+                    engine_learning=bool(opts.get("engine_learning", True)),
                     stop=lambda: job.cancel_requested)
         if budget > 900:
             job.msg(f"long run: {'until stopped' if budget > 7 * 24 * 3600 else f'{budget / 60:.0f} min'}; "
@@ -734,6 +735,11 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict, mode: str = "
             else:
                 job.msg(f"Serum verification unavailable: {serum.get('error')}")
         raw_serum = serum.pop("raw_audio", None)
+        if synth is not None and serum.get("ok"):
+            sv = serum_host.verify((out / synth["file"]).read_bytes(), a.notes, y44, 44100, gain=gain44)
+            if sv.get("ok"):
+                synth["serum_accuracy"] = sv["score"]
+                job.msg(f"real Serum: best overall {serum['score']}%, synthesis only {sv['score']}%")
         engine_gap = None
         if learning and serum.get("ok") and raw_serum is not None:
             engine_gap = learn_from_serum(job, res, opt, bank, a.notes, r44, raw_serum, y44, gain44, serum,
@@ -741,9 +747,15 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict, mode: str = "
                                           float(opts.get("learn_minutes") or 3) * 60, corrected=corrected)
         summary = {
             "id": rid, "mode": mode, "from_result": from_rid, "stem": stem, "start": start, "end": end, "bpm": bpm, "name": name,
-            "accuracy": round(res.score, 2), "metric": "waveform_similarity", "details": res.details,
+            # real Serum 2 is the judge: its score is the headline whenever it was heard
+            "accuracy": round(serum["score"] if serum.get("ok") else res.score, 2),
+            "accuracy_source": "serum" if serum.get("ok") else "engine",
+            "engine_accuracy": round(res.score, 2),
+            "metric": "waveform_similarity", "details": res.details,
             "metric_info": METRIC_INFO, "target": o.target_score,
-            "met_target": res.score >= o.target_score, "used_custom_wavetable": True,
+            "met_target": (serum["score"] if serum.get("ok") else res.score) >= o.target_score,
+            "used_custom_wavetable": True,
+            "engine_correction": getattr(res, "engine_correction", None),
             "sidechain": {k: v for k, v in sc.items() if k != "kicks"},
             "sidechain_logic": SC.logic_settings(sc),
             "patch": res.patch.to_dict(), "description": res.patch.describe(), "stages": res.stages,

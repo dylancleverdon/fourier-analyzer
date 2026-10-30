@@ -625,6 +625,20 @@ function drawRoll(a, sc) {
 
 // ------------------------------------------------------------------ reconstruction
 $("#target").oninput = () => ($("#targetVal").textContent = $("#target").value);
+// options that only matter when their checkbox is on are greyed out otherwise
+function syncDeps() {
+  document.querySelectorAll("[data-dep]").forEach((el) => {
+    const on = $("#" + el.dataset.dep).checked;
+    el.classList.toggle("disabled-dep", !on);
+  });
+}
+document.querySelectorAll(".recon-opts input[type=checkbox]").forEach((c) => c.addEventListener("change", syncDeps));
+syncDeps();
+api("/api/system").then((sys) => {
+  const st = $("#serumStatus");
+  if (sys.serum_plugin) { st.textContent = "found"; st.className = "status ok"; st.title = sys.serum_plugin; }
+  else { st.textContent = "not found"; st.className = "status off"; $("#serumMissing").hidden = false; }
+}).catch(() => {});
 $("#budget").onchange = () => ($("#budgetCustomWrap").hidden = $("#budget").value !== "custom");
 function budgetSeconds() {
   const v = $("#budget").value;
@@ -640,7 +654,7 @@ $("#runRecon").onclick = async () => {
     learn: $("#learnSerum").checked, serum_only: $("#serumOnly").checked,
     prefer_synthesis: 1 - parseFloat($("#preferSynth").value) / 100,
     serum_checkpoints: $("#serumCheckpoints").checked, checkpoint_minutes: parseFloat($("#checkpointMin").value),
-    holdout: $("#holdout").checked,
+    holdout: $("#holdout").checked, engine_learning: $("#engineLearning").checked,
     serum_structure: $("#serumStructure").checked, serum_finalists: parseInt($("#serumFinalists").value, 10) || 3,
     serum_structure_minutes: parseFloat($("#serumStructMin").value),
     verify_serum: $("#verifySerum").checked,
@@ -656,6 +670,9 @@ function showResult(r) {
   $("#result").hidden = false;
   document.querySelector('.tab[data-tab="recon"]').click();
   $("#accVal").textContent = fmt(r.accuracy, 1);
+  const bySerum = r.accuracy_source === "serum";
+  $("#accLabel").textContent = bySerum ? "waveform similarity % in real Serum 2" : "waveform similarity % (our engine; Serum 2 not heard)";
+  $("#accEngine").textContent = bySerum && r.engine_accuracy != null ? `our engine predicted ${fmt(r.engine_accuracy, 1)}%` : "";
   const badge = $("#accBadge");
   badge.className = "badge " + (r.met_target ? "ok" : "warn");
   badge.textContent = r.met_target ? `target ${r.target}% reached` : `below target ${r.target}%: try a longer search or a cleaner selection`;
@@ -699,7 +716,7 @@ function showResult(r) {
   $("#dlMidi").href = base + "notes.mid"; $("#dlMidi").download = r.name + ".mid";
   const so = r.synth_only;
   $("#synthOnly").innerHTML = so
-    ? `<b>Two presets:</b> best overall ${fmt(r.accuracy, 1)}% (uses a sample-based oscillator) · <b>synthesis only ${fmt(so.accuracy, 1)}%</b> `
+    ? `<b>Two presets:</b> best overall ${fmt(r.accuracy, 1)}% (uses a sample-based oscillator) · <b>synthesis only ${fmt(so.serum_accuracy != null ? so.serum_accuracy : so.accuracy, 1)}%${so.serum_accuracy != null ? " in Serum" : ""}</b> `
       + `<a href="${base + encodeURIComponent(so.file)}" download="${esc(so.file)}">download synthesis-only preset</a>`
     : (r.mode !== "retune" ? "Synthesis only: no sample-based oscillator was needed." : "");
   const ho = r.holdout, pc = r.pitch_check;
@@ -813,6 +830,7 @@ async function showEngine() {
   const rows = (arr, cols) => `<table class="small"><tr>${cols.map((c) => `<th>${c[0]}</th>`).join("")}</tr>${arr.map((x) => `<tr>${cols.map((c) => `<td>${esc(String(c[1](x)))}</td>`).join("")}</tr>`).join("")}</table>`;
   body.innerHTML = `<p><b>${s.runs}</b> runs logged. On average real Serum scores <b>${fmt(s.avg_drop, 2)}</b> points ${s.avg_drop >= 0 ? "below" : "above"} our prediction; our renders and Serum's are ${fmt(s.avg_engine_similarity, 1)}% alike.</p>`
     + `<h4>Biggest causes (switching the part off closes the gap by)</h4>` + (s.culprits.length ? rows(s.culprits.slice(0, 10), [["Part", (x) => x.component], ["Runs", (x) => x.runs], ["Avg. gap explained", (x) => fmt(x.avg_explains, 2) + " %"]]) : "<p class='muted small'>none yet</p>")
+    + (s.engine_correction && s.engine_correction.runs ? `<h4>Our engine, corrected towards Serum (from ${s.engine_correction.runs} runs)</h4><p class="small">${Object.entries(s.engine_correction.values).map(([k, v]) => `${esc(k)} ${["level_db", "tilt"].includes(k) ? (v >= 0 ? "+" : "") + fmt(v, 2) + (k === "tilt" ? " dB/oct" : " dB") : "×" + fmt(v, 3)}`).join(" · ")}</p>` : "")
     + (s.fix_first && s.fix_first.length ? `<h4>Fix these emulations first (differ most from real Serum)</h4>` + rows(s.fix_first.slice(0, 10), [["FX / warp", (x) => x.emulation], ["Gap explained", (x) => fmt(x.explained, 2)], ["Serum disagreed", (x) => `${x.disagreed} of ${x.checks}`], ["Priority", (x) => fmt(x.priority, 2)]]) : "")
     + (s.structure_checks && s.structure_checks.length ? `<h4>Structure decisions checked in real Serum 2 (where it disagreed with our engine)</h4>` + rows(s.structure_checks.slice(0, 12), [["Part", (x) => x.part], ["Checks", (x) => x.checks], ["Serum disagreed", (x) => x.disagreed], ["Our engine Δ", (x) => fmt(x.avg_engine_delta, 2)], ["Serum Δ", (x) => fmt(x.avg_serum_delta, 2)]]) : "")
     + `<h4>Features with the largest score drop</h4>` + rows(s.features.slice(0, 10), [["Feature", (x) => x.feature], ["Runs", (x) => x.runs], ["Avg. drop", (x) => fmt(x.avg_drop, 2)]])

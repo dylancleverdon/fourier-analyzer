@@ -96,6 +96,10 @@ There is deliberately no signing or checksum verification; update speed was prio
 
    **Checked against real Serum 2 all the way** (on by default when Serum 2 is installed): besides the structure finalists and pruning, the best patch is rendered in Serum after every stage (wavetable choice, each structure round, pruning, each part of the fine-tune) and every few minutes (setting); if Serum's score lags our engine's, it is tuned up inside Serum before the search continues. The best few fine-tune candidates are compared in Serum, not just the winner. Large patches are fine-tuned in groups (oscillators and warps, then filters and modulation, then FX) before all together, and long runs get more Serum time.
 
+   **Our engine corrects itself during the run.** At every checkpoint the same patch exists twice (our engine's render and real Serum's), so the app fits quick corrections that make our engine sound like Serum for the rest of the run: overall level, brightness tilt, filter cutoff scale and amp-envelope timing. Each correction is kept only while it makes our engine match Serum better (it is dropped as soon as it doesn't), and corrections that held up are saved and start the next run (Engine accuracy shows them; Reset corrections clears them).
+
+   **Real Serum decides.** When Serum 2 is installed, its score is the one that counts: the headline result is real Serum's waveform similarity (our engine's prediction is shown under it), the target is judged in Serum, structure and fine-tune choices are made by Serum, and at the end the best patch Serum heard during the run wins, even if our engine preferred a later one.
+
    **Works on every note.** The last note (or whatever lies past the first 6 s) is held out of the fit and the final patch is scored on it too, and the whole patch is played a fifth below and above its notes to make sure no wobble or LFO rate follows the pitch.
 
    **Tune this patch in Serum 2** (under every result) loads that result's preset back into the real plugin and keeps tuning it for the time you pick (2 min to 2 hours). The outcome is saved as a new result; the original stays as it is.

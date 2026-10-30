@@ -70,6 +70,7 @@ class Options:
     sample_margin: float = 1.0         # a sample-based part must beat synthesis by this much
     checkpoint_minutes: float = 3.0    # real-Serum checkpoint interval during long stages
     holdout: bool = True               # keep some notes out of the fit and score them at the end
+    engine_learning: bool = True       # correct our engine from each Serum checkpoint during the run
 
 
 @dataclass
@@ -88,6 +89,8 @@ class Result:
     holdout: dict | None = None            # score on notes kept out of the fit
     pitch_check: dict | None = None        # whole patch at transposed pitches
     checkpoints: list = field(default_factory=list)
+    serum_details: dict | None = None      # real Serum's metrics for the final patch (during the run)
+    engine_correction: dict | None = None
 
 
 class Optimizer:
@@ -140,6 +143,14 @@ class Optimizer:
         self.checkpoints: list[dict] = []
         self._last_cp = time.time()
         self._tune_top: list = []
+        # our engine, corrected towards real Serum (starts from what earlier runs learned)
+        from .engine_correction import EngineCorrection, load_saved
+        self.ecorr = load_saved() if self.opts.engine_learning else EngineCorrection()
+        self.ecorr_start = self.ecorr.as_dict()
+        self.ecorr_log: list[dict] = []
+        self._ecorr_ok = 0                         # checkpoints where the correction beat no correction
+        self._ecorr_last_ok = False
+        self.best_serum: tuple | None = None       # (patch, serum objective, engine score) best by real Serum
         self._source_root = 60.0
         self.renderer = Renderer(self.bank, OPT_SR, samples=self.samples)
         self._judge = None             # SerumJudge: real Serum 2 confirms structure decisions
@@ -213,7 +224,14 @@ class Optimizer:
             log.info("[%s] %.1f %s", stage, self.best_score, msg)
 
     def render(self, patch: Patch) -> np.ndarray:
-        """Patch output as heard in the track (sidechain applied)."""
+        """Patch output as heard in the track (sidechain applied), through our
+        engine as corrected towards real Serum so far."""
+        y = self.renderer.render(self.ecorr.adjust_patch(patch), self.notes, self.duration)
+        y = self.ecorr.post(y, OPT_SR)
+        return y * self.gain if self.gain is not None else y
+
+    def render_raw(self, patch: Patch) -> np.ndarray:
+        """Our engine without corrections (for fitting them)."""
         y = self.renderer.render(patch, self.notes, self.duration)
         return y * self.gain if self.gain is not None else y
 
@@ -954,10 +972,32 @@ class Optimizer:
     def finish(self, p: Patch, score: float) -> Result:
         """Final metrics plus the synthesis-only patch, the hold-out score, the
         whole-patch transposed-pitch check and the Serum checkpoints."""
+        # real Serum has the last word: the best patch it heard during the run wins
+        serum_final = None
+        if self.judge is not None and self.judge.available():
+            r = self.judge.score(p)
+            if r is not None:
+                serum_final = r
+                self._accept_serum(p, r[0])
+                bp, bs = self.best_serum
+                if bp is not p and bs - self.cost(bp) > r[0] - self.cost(p) + 0.25:
+                    self.stages.append({"stage": "real Serum's choice", "score": round(self.evaluate(bp), 2),
+                                        "note": f"an earlier patch scored higher in real Serum ({bs:.1f} vs "
+                                                f"{r[0]:.1f}), so it replaces the final one"})
+                    self.report("final", f"real Serum preferred an earlier patch ({bs:.1f} vs {r[0]:.1f})")
+                    p = bp
+                    serum_final = self.judge.score(p)
         metrics = self.ref.all(self.render(p))
         total = metrics["waveform_similarity"]
         res = Result(patch=p, score=total, details=metrics, notes=self.analysis.notes, bank=self.bank,
                      history=self.history, used_custom=True, stages=self.stages, samples=self.samples)
+        if serum_final is not None:
+            res.serum_details = serum_final[1]
+        res.engine_correction = {"start": self.ecorr_start, "final": self.ecorr.as_dict(), "log": self.ecorr_log,
+                                 "validated": self._ecorr_ok}
+        if self.opts.engine_learning and self.judge is not None and not self.ecorr.is_identity():
+            from .engine_correction import save_run
+            save_run(self.ecorr, helped=self._ecorr_ok >= 1 and self._ecorr_last_ok)
         if self.uses_samples(p) and self.best_synth is not None:
             sp, ss = self.best_synth
             if self.time_left() > 3 and not self.stopped and not getattr(self, "_serum_only", False):
@@ -1059,6 +1099,57 @@ class Optimizer:
     def _accept_serum(self, q: Patch, ss: float | None) -> None:
         if ss is not None:
             self._serum_p, self._serum_s = q, ss
+            e = ss - self.cost(q)
+            if self.best_serum is None or e > self.best_serum[1] - self.cost(self.best_serum[0]):
+                self.best_serum = (q, ss)
+
+    def target_reached(self, p: Patch) -> bool:
+        """Judged by real Serum's waveform similarity when Serum is available."""
+        if self.judge is not None and self.judge.available():
+            r = self.judge.score(p)
+            if r is not None:
+                return r[1].get("waveform_similarity", 0.0) >= self.opts.target_score
+        return self.ref.waveform(self.render(p)) >= self.opts.target_score
+
+    def learn_engine(self, p: Patch, label: str) -> bool:
+        """Fit our engine's corrections to real Serum's render of ``p`` (the
+        judge's last render). First check that the current correction still
+        helps (else drop it), then refine it. Returns True if it changed."""
+        from ..audio import resample
+        from .engine_correction import EngineCorrection, fit, match
+        ys = self.judge.last_audio if self.judge is not None else None
+        if not self.opts.engine_learning or ys is None or self.time_left() < 10:
+            return False
+        ys = np.asarray(resample(ys, self.judge.sr, OPT_SR), dtype=np.float64)[: len(self.y)]
+        ys = np.pad(ys, (0, max(0, len(self.y) - len(ys))))
+        row = {"at": label}
+        changed = False
+        raw = self.render_raw(p)
+        m_id = match(raw, ys, OPT_SR)
+        if not self.ecorr.is_identity():
+            m_cur = match(self.render(p), ys, OPT_SR)
+            row.update(match_corrected=round(m_cur, 2), match_plain=round(m_id, 2))
+            self._ecorr_last_ok = m_cur > m_id + 0.1
+            if self._ecorr_last_ok:
+                self._ecorr_ok += 1
+            elif m_cur < m_id - 0.1:
+                row["dropped"] = self.ecorr.as_dict()
+                self.ecorr = EngineCorrection()
+                changed = True
+                self.report(self.stage, f"engine correction dropped at {label}: it no longer matched Serum better")
+        limit = float(np.clip(0.05 * self.opts.time_budget, 5.0, 20.0))
+        new, before, after = fit(self.ecorr, self.render_raw_for(), p, ys, OPT_SR, time_limit=limit)
+        if after > before + 0.2:
+            self.ecorr = new
+            changed = True
+            row.update(fitted=new.as_dict(), match_before=round(before, 2), match_after=round(after, 2))
+            self.report(self.stage, f"engine corrected towards real Serum at {label}: match {before:.1f} -> "
+                                    f"{after:.1f} ({', '.join(f'{k} {v}' for k, v in new.as_dict().items())})")
+        self.ecorr_log.append(row)
+        return changed
+
+    def render_raw_for(self):
+        return lambda q: self.render_raw(q)
 
     # ------------------------------------------------------------------
     # synthesis first: only sample-based oscillators and multi-frame
@@ -1108,12 +1199,16 @@ class Optimizer:
         self._last_cp = time.time()
         if self.judge is None or not self.judge.available():
             return p, score
-        r = self.judge.score(p)
+        r = self.judge.score(p, want_audio=self.opts.engine_learning)
         if r is None:
             return p, score
         ss = r[0]
         row = {"at": label, "engine": round(score, 2), "serum": round(ss, 2), "lag": round(score - ss, 2),
-               "t": round(time.time() - self.t0, 1)}
+               "t": round(time.time() - self.t0, 1), "serum_waveform": r[1].get("waveform_similarity")}
+        if self.learn_engine(p, label):
+            score = self.evaluate(p)                  # the corrected engine judges anew
+            row["engine_corrected"] = round(score, 2)
+        self._accept_serum(p, ss)
         if score - ss > self.CHECKPOINT_LAG:
             self.activity = f"Serum lags our engine by {score - ss:.1f}: tune-up inside real Serum 2"
             q, ss2 = self.judge.tune_up(p, None, ss, renders=max(12, self.judge.tune_renders), all_params=True)
@@ -1242,7 +1337,7 @@ class Optimizer:
             return None
         a, b = self.holdout_range
         full_d = len(self.full_y) / OPT_SR
-        y = self.renderer.render(p, self.analysis.notes, full_d)
+        y = self.ecorr.post(self.renderer.render(self.ecorr.adjust_patch(p), self.analysis.notes, full_d), OPT_SR)
         if self.full_gain is not None:
             g = self.full_gain[: len(y)]
             y = y[: len(g)] * g
@@ -1272,7 +1367,7 @@ class Optimizer:
         lf = self.analysis.lfo
         self._note_synth(p, score)
         while self.pass_left() > floor and score < 99.0:
-            if added and not opts.keep_going and self.ref.waveform(self.render(p)) >= opts.target_score:
+            if added and not opts.keep_going and self.target_reached(p):
                 break
             if require_serum and (self.judge is None or not self.judge.available()):
                 break
@@ -1463,7 +1558,7 @@ class Optimizer:
         rounds, checks = [], []
         r = 0
         while self.time_left() > self.wave_reserve + 20 and score < 99.5:
-            if not opts.keep_going and self.ref.waveform(self.render(p)) >= opts.target_score:
+            if not opts.keep_going and self.target_reached(p):
                 break
             r += 1
             start_score = score
