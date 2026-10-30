@@ -63,7 +63,7 @@ def test_sample_oscillator_from_the_original_survives_the_preset():
         assert q.oscs[0].type == kind and q.oscs[0].smp.source.startswith("embedded:")
         _, st = read_preset_bytes(build_preset_bytes(q, opt.bank, samples=opt.samples))
         back = SampleBank()
-        r = state_to_patch(st, TableBank(), samples=back)
+        r = state_to_patch(st, TableBank(), samples=back, bpm=q.bpm)   # Serum takes the host tempo
         assert r.oscs[0].type == kind
         a = Renderer(opt.bank, OPT_SR, samples=opt.samples).render(q, notes, 1.2)
         b = Renderer(TableBank(), OPT_SR, samples=back).render(r, notes, 1.2)

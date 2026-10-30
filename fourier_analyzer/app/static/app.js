@@ -704,6 +704,7 @@ function showResult(r) {
   $("#stages").innerHTML = r.stages.map((s) => `<li><b>${esc(s.stage)}</b>: ${fmt(s.score, 1)}${s.table ? " · " + esc(s.table) : ""}`
     + (s.steps && s.steps.length ? "<br><span class='muted small'>" + s.steps.map(stepText).join("<br>") + "</span>" : "")
     + (s.serum_checks && s.serum_checks.length ? "<br><span class='small'>Checked in real Serum 2:<br>" + s.serum_checks.map(checkText).join("<br>") + "</span>" : "")
+    + (s.wobble_rejects && s.wobble_rejects.length ? "<br><span class='muted small'>Rejected (LFO wobble would follow the pitch):<br>" + s.wobble_rejects.map((w) => "× " + esc(w.candidate) + ": " + esc(w.why)).join("<br>") + "</span>" : "")
     + "</li>").join("")
     + (r.serum_structure ? `<li class="muted small">Real Serum 2 structure checks: ${r.serum_structure.checks.length} decisions, ${r.serum_structure.agreed} agreed, ${r.serum_structure.renders} renders in ${fmt(r.serum_structure.seconds, 0)} s${r.serum_structure.error ? " · " + esc(r.serum_structure.error) : ""}</li>` : "");
   $("#checks").innerHTML = r.checks.map((c) => `<li class="st-${c.status}"><b>${c.name}</b>: ${c.detail}${c.note ? ` <span class="muted">(${c.note})</span>` : ""}</li>`).join("");

@@ -1244,7 +1244,7 @@ class Renderer:
                                         patch.tuning_a4)
         elif o.type == "spectral":
             y = sampler.render_spectral(smp, cfg, o.spec, f, tl.bounds, tl.gate, self.sr, rng, warps, mod_sigs,
-                                        uni, patch.tuning_a4)
+                                        uni, patch.tuning_a4, bpm=patch.bpm)
         elif o.type == "multisample":
             y = sampler.render_multisample(self.samples, cfg, o.multi, f, tl.bounds, tl.vel, self.sr, rng,
                                            tl.note_pitch, patch.tuning_a4, uni)

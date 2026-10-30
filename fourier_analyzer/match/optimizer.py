@@ -107,6 +107,10 @@ class Optimizer:
         # full-rate audio for the sample / granular / spectral oscillators
         self.source_audio = source_audio or (self.full_y, OPT_SR)
         self._source_sid: str | None = None
+        self._source_flat = False
+        self._source_len = 0
+        self.move_penalty: dict[str, float] = {}     # ranking penalty per move name
+        self.wobble_rejects: list[dict] = []
         self._source_root = 60.0
         self.renderer = Renderer(self.bank, OPT_SR, samples=self.samples)
         self._judge = None             # SerumJudge: real Serum 2 confirms structure decisions
@@ -555,7 +559,11 @@ class Optimizer:
     def source_sample(self) -> tuple[str | None, float]:
         """One note of the original, embedded as a sample (with the sidechain
         ducking divided out): the source for sample / granular / spectral
-        oscillators. Returns (sample id, root note)."""
+        oscillators. When the analysis found an LFO, the note's loudness and
+        filter movement are flattened first, so the wobble is not baked into
+        the sample (it goes into an LFO routing instead; see wobble.py).
+        Returns (sample id, root note)."""
+        from .wobble import flatten_movement
         if self._source_sid is not None or not self.notes:
             return self._source_sid, self._source_root
         y, sr = self.source_audio
@@ -574,44 +582,115 @@ class Optimizer:
         if len(seg) < int(0.03 * sr):
             self._source_sid = ""
             return "", 60.0
+        self._source_flat = False
+        if self.analysis.lfo:
+            seg = flatten_movement(seg, sr, 440.0 * 2 ** ((n.pitch - 69) / 12))
+            self._source_flat = True
         fade = min(len(seg) // 4, int(0.01 * sr))
         seg[-fade:] *= np.linspace(1.0, 0.0, fade)
         seg = seg / max(1e-9, float(np.max(np.abs(seg))))
         self._source_root = float(n.pitch)
+        self._source_len = len(seg)
         self._source_sid = self.samples.add(seg.astype(np.float32), sr, root=self._source_root,
-                                            name="Fourier Analyzer source")
+                                            name="Fourier Analyzer source" + (" (flattened)" if self._source_flat else ""))
         return self._source_sid, self._source_root
+
+    def wobble_check(self, q: Patch) -> dict:
+        """Render one held note at three pitches (root and a fifth either side)
+        and make sure any wobble stays at one rate (the synced LFO's, when
+        there is one) instead of following the pitch."""
+        from ..synth.patch import Note
+        from .wobble import pitch_tracking
+        lf = self.analysis.lfo
+        rate = lf["rate_hz"] if lf and lf.get("sync") else None
+        dur = float(np.clip(3.5 / rate, 1.2, 3.0)) if rate else 1.5
+        root = self._source_root
+
+        def render(pt, d):
+            return self.renderer.render(q, [Note(0.0, d, pt)], d + 0.05), OPT_SR
+        return pitch_tracking(render, [root - 7, root, root + 7], dur, rate,
+                              wobble_hz=lf["rate_hz"] if lf else None)
 
     def _sample_moves(self, p: Patch, mv) -> None:
         """Sample, granular and spectral oscillators playing a note of the
-        original: in place of osc A, or as an extra layer."""
+        original: in place of osc A, or as an extra layer. With an LFO in the
+        sound, the note is flattened, the sample oscillator loops less than
+        half an LFO cycle, granular / spectral scan tempo-locked (never at a
+        pitch-dependent speed), a tempo-synced wobble is put in an LFO
+        routing, and any candidate whose wobble still follows the pitch is
+        rejected. Granular / spectral are preferred over the plain sampler."""
+        from .wobble import short_loop
         if any(o.enabled and o.type != "wavetable" for o in p.oscs):
             return
         sid, root = self.source_sample()
         if not sid:
             return
+        lf = self.analysis.lfo
+        synced = bool(lf and lf.get("sync"))
         free = next((i for i in (1, 2) if not p.oscs[i].enabled), None)
+        bpm = float(self.analysis.bpm or p.bpm or 120.0)
+        f0 = 440.0 * 2 ** ((root - 69) / 12)
 
         def make(kind: str, level: float) -> Osc:
             o = Osc(enabled=True, type=kind, level=level, table="basic:sine")
-            o.smp = SampleCfg(source=sid, root=root, loop="forward" if kind == "sample" else "off",
-                              loop_start=0.4, loop_end=0.95, crossfade=0.3)
-            if kind == "granular":
-                o.gran = GranularCfg(density=40.0, length=0.08, rand_offset=0.05)
-            if kind == "spectral":
-                o.spec = SpectralCfg()
+            if kind == "sample":
+                if lf:
+                    ls, le = short_loop(self._source_len, self.source_audio[1], f0, lf.get("period_s"))
+                    o.smp = SampleCfg(source=sid, root=root, loop="forward", loop_start=ls, loop_end=le, crossfade=0.15)
+                else:
+                    o.smp = SampleCfg(source=sid, root=root, loop="forward", loop_start=0.4, loop_end=0.95,
+                                      crossfade=0.3)
+            else:
+                # tempo-locked scan: the playback position moves with the song
+                # tempo, never with the played pitch
+                o.smp = SampleCfg(source=sid, root=root, loop="forward", loop_start=0.3, loop_end=0.95,
+                                  crossfade=0.3, scan=1.0, scan_tempo_lock=True, base_tempo=bpm)
+                if kind == "granular":
+                    o.gran = GranularCfg(density=40.0, length=0.08, rand_offset=0.05)
+                else:
+                    o.spec = SpectralCfg()
             return o
-        for kind in ("sample", "granular", "spectral"):
+
+        def with_lfo(q: Patch) -> Patch:
+            """Keep a tempo-synced wobble in an LFO routing."""
+            if not synced or any(m.source.startswith("lfo") and m.amount and m.dest != "pitch" for m in q.mods):
+                return q
+            used = {m.source for m in q.mods}
+            k = next((j for j in range(4) if f"lfo{j + 1}" not in used), None)
+            if k is None:
+                return q
+            q.lfos[k] = LFO(shape="custom", sync=lf["sync"], rate_hz=lf["rate_hz"], mode="trig",
+                            points=lf["shape_points"] + [[1.0, lf["shape_points"][0][1]]])
+            if lf["feature"] == "volume":
+                q.mods.append(Mod(f"lfo{k + 1}", "amp", -0.5))
+            else:
+                if not q.filter.enabled:
+                    q.filter.enabled, q.filter.type = True, "lp24"
+                q.mods.append(Mod(f"lfo{k + 1}", "filter.cutoff", 0.3))
+            return q
+
+        suffix = " + synced LFO wobble" if synced else ""
+        for kind in ("granular", "spectral", "sample"):          # preferred first
             def f(q, kind=kind):
                 lvl = q.oscs[0].level
                 q.oscs[0] = make(kind, lvl)
-                return q
-            mv(f"osc A as {kind} oscillator (a note of the original)", f, {"osc"})
+                return with_lfo(q)
+            cands = [(f"osc A as {kind} oscillator (a note of the original){suffix}", f)]
             if free is not None:
                 def g(q, kind=kind):
                     q.oscs[free] = make(kind, 0.35)
-                    return q
-                mv(f"{kind} layer on osc {'ABC'[free]} (a note of the original)", g, {"osc"})
+                    return with_lfo(q)
+                cands.append((f"{kind} layer on osc {'ABC'[free]} (a note of the original){suffix}", g))
+            for name, fn in cands:
+                if lf:
+                    chk = self.wobble_check(fn(p.copy()))
+                    if not chk["ok"]:
+                        self.wobble_rejects.append({"candidate": name, "why": chk["why"]})
+                        self.report(self.stage, f"rejected '{name}': {chk['why']}")
+                        continue
+                    if kind == "sample":
+                        self.move_penalty[name] = 1.0     # prefer granular / spectral with tempo lock
+                mv(name, fn, {"osc"})
 
     def prune_moves(self, p: Patch):
         moves = []
@@ -853,7 +932,8 @@ class Optimizer:
                 self.activity = f"screening: {name}"
                 q = fn(p.copy())
                 quick.append((self.evaluate(q), name, q, focus))
-            quick.sort(key=lambda r: -r[0])
+            pen = lambda name: self.move_penalty.get(name, 0.0)       # noqa: E731 (ranking preference)
+            quick.sort(key=lambda r: -(r[0] - pen(r[1])))
             screened = []
             for _, name, q, focus in quick[:12]:
                 if self.pass_left() < floor * 0.85:
@@ -861,7 +941,7 @@ class Optimizer:
                 self.activity = f"short tune: {name}"
                 q, s = self.tune(q, 12, focus=focus, sigma=0.2)
                 screened.append((s, name, q, focus))
-            screened.sort(key=lambda r: -r[0])
+            screened.sort(key=lambda r: -(r[0] - pen(r[1])))
             tested = []
             for s0, name, q, focus in screened[:4]:
                 if self.pass_left() < floor * 0.85:
@@ -869,7 +949,19 @@ class Optimizer:
                 self.activity = f"testing best candidate: {name}"
                 q, s = self.tune(q, 48, focus=focus | {"filter", "osc", "env"}, sigma=0.1)
                 tested.append((s, name, q, focus))
-            improvers = sorted((t for t in tested if t[0] > score + 0.25), key=lambda t: -t[0])
+            improvers = sorted((t for t in tested if t[0] > score + 0.25), key=lambda t: -(t[0] - pen(t[1])))
+            # a tuned sample-based candidate must still keep its wobble out of
+            # the sample (rate steady across pitches, at the synced rate)
+            checked = []
+            for t in improvers:
+                if "(a note of the original)" in t[1] and self.analysis.lfo:
+                    chk = self.wobble_check(t[2])
+                    if not chk["ok"]:
+                        self.wobble_rejects.append({"candidate": t[1], "why": chk["why"], "after_tuning": True})
+                        self.report("structure", f"rejected '{t[1]}' after tuning: {chk['why']}")
+                        continue
+                checked.append(t)
+            improvers = checked
             if not improvers:
                 break
             # finalists in real Serum: the one Serum likes best among those it agrees with
@@ -902,7 +994,7 @@ class Optimizer:
                           "serum": row["serum_after"], "agreed": True})
             self.report("structure", f"kept '{name}' -> {score:.1f} (real Serum {row['serum_after']:.1f})")
         self.stages.append({"stage": "structure search", "score": round(score, 2), "steps": added,
-                            "serum_checks": checks})
+                            "serum_checks": checks, "wobble_rejects": list(self.wobble_rejects)})
         return p, score
 
     def prune(self, p: Patch, score: float, require_serum: bool = False) -> tuple[Patch, float]:
@@ -985,6 +1077,8 @@ class Optimizer:
                 self.activity = f"round {r}: tuning {name}"
                 q, s = self.tune(q, 120, focus=focus | {"filter", "osc", "env", "mod"}, sigma=0.1)
                 if s > score + 0.15:
+                    if "(a note of the original)" in name and self.analysis.lfo and not self.wobble_check(q)["ok"]:
+                        continue
                     row, q, s, ss = self.serum_check("add", name, p, score, q, s, focus)
                     if row is not None:
                         checks.append(row)

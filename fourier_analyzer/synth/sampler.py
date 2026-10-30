@@ -156,6 +156,14 @@ def _window(shape: str, m: int, skew: float, amount: float) -> np.ndarray:
     return (1 - amount) + amount * w
 
 
+def tempo_factor(cfg, bpm: float) -> float:
+    """Scan TEMPO LOCK: the scan speed follows the song tempo relative to the
+    sample's base tempo (and never the played pitch)."""
+    if getattr(cfg, "scan_tempo_lock", False) and getattr(cfg, "base_tempo", 0.0) > 0:
+        return float(bpm) / float(cfg.base_tempo)
+    return 1.0
+
+
 def render_granular(smp: Sample, cfg, gcfg, freq, bounds, gate, sr, rng, bpm: float = 140.0,
                     unison=None, a4: float = 440.0) -> np.ndarray:
     n = len(freq)
@@ -211,7 +219,7 @@ def render_granular(smp: Sample, cfg, gcfg, freq, bounds, gate, sr, rng, bpm: fl
                 if cfg.manual_position:
                     head = cfg.position
                 else:
-                    sp = cfg.scan * (ratio / sr_ratio if cfg.scan_keytrack else 1.0)
+                    sp = cfg.scan * tempo_factor(cfg, bpm) * (ratio / sr_ratio if cfg.scan_keytrack else 1.0)
                     head = (tg * smp.sr * sp) / max(e_idx - s_idx, 1)
                     head = np.mod(head, 1.0) if cfg.loop != "off" else min(head, 1.0)
                 src = s_idx + (head + gcfg.rand_offset * (rng.random() - 0.5)) * (e_idx - s_idx)
@@ -346,7 +354,7 @@ SPECTRAL_WARPS = ("SpectralComb", "Spread", "Gate", "Addharmonics", "Addsubharmo
 
 
 def render_spectral(smp: Sample, cfg, scfg, freq, bounds, gate, sr, rng, warps=(), mod_sigs=None,
-                    unison=None, a4: float = 440.0) -> np.ndarray:
+                    unison=None, a4: float = 440.0, bpm: float = 140.0) -> np.ndarray:
     """Phase-vocoder resynthesis: scan through the sample's spectrum, shifted to
     the played pitch, band limited, spectrally filtered and warped."""
     n = len(freq)
@@ -432,7 +440,7 @@ def render_spectral(smp: Sample, cfg, scfg, freq, bounds, gate, sr, rng, warps=(
                     pass                          # transients keep the input phase jump (approximate)
                 frame = np.fft.irfft(mo * np.exp(1j * phase), n=nfft_out) * win
                 y[j * hop_out: j * hop_out + nfft_out] += frame
-                pos += cfg.scan * (ratio if cfg.scan_keytrack else 1.0) * hop_out * smp.sr / sr / SPEC_HOP
+                pos += cfg.scan * tempo_factor(cfg, bpm) * (ratio if cfg.scan_keytrack else 1.0) * hop_out * smp.sr / sr / SPEC_HOP
             y = y[nfft_out // 2: nfft_out // 2 + length] * (2.0 / 3.0) / (SPEC_N / 2) * 4
             gl, gr = _pan_gains(pan)
             out[0, s0:nxt] += g * gl * y[: nxt - s0]
