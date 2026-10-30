@@ -81,6 +81,23 @@ def test_full_flow(monkeypatch):
     assert c.get("/api/calibration/export").status_code == 200
     f = c.get(f"/api/projects/{pid}/results/{res['id']}/file/notes.mid")
     assert f.status_code == 200
+    # put that result back into "Serum" and keep tuning it: a new result
+    rt = c.post(f"/api/projects/{pid}/results/{res['id']}/retune", json={"minutes": 0.15, "learn": False})
+    j = _wait(c, rt.json()["job"], timeout=300)
+    assert j["status"] == "done", j.get("error")
+    r2 = j["result"]
+    assert r2["mode"] == "retune" and r2["from_result"] == res["id"] and r2["id"] != res["id"]
+    assert r2["serum_tune"]["ok"] and r2["serum_tune"]["after"] >= r2["serum_tune"]["before"]
+    assert any(f.endswith(".SerumPreset") for f in r2["files"])
+    # Serum only: no search in our engine, all the time goes to tuning in Serum
+    so = c.post(f"/api/projects/{pid}/reconstruct",
+                json={"stem": "bass", "start": 0.0, "end": 1.9, "time_budget": 10, "serum_only": True,
+                      "learn": False})
+    j = _wait(c, so.json()["job"], timeout=300)
+    assert j["status"] == "done", j.get("error")
+    r3 = j["result"]
+    assert r3["mode"] == "serum_only" and r3["serum_tune"]["evals"] > 5
+    assert not any(s["stage"] in ("structure search", "fine-tune") for s in r3["stages"])
 
 
 def test_cancel_job():

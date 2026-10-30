@@ -31,14 +31,17 @@ def objective(d: dict) -> float:
 def tune_in_serum(patch: Patch, bank, notes, y_target: np.ndarray, sr: int, budget_s: float,
                   gain: np.ndarray | None = None, stop: Callable[[], bool] | None = None,
                   progress: Callable[[str, float, float, dict], None] | None = None,
-                  session_factory=SerumSession, sigma: float = 0.06, samples=None) -> tuple[Patch, dict]:
+                  session_factory=SerumSession, sigma: float = 0.06, samples=None,
+                  use_corrections: bool = True) -> tuple[Patch, dict]:
     """Return (best patch, info). Never worse than the input: the starting
     patch is kept unless a candidate scores higher in real Serum. Raises
     SerumHostError only if Serum cannot render the starting patch."""
     import cma
 
     from .. import calibration
-    corr = calibration.load_corrections()          # learned export corrections
+    # learned export corrections (off when the patch came from a preset, i.e.
+    # its values are already what Serum gets)
+    corr = calibration.load_corrections() if use_corrections else {"params": {}}
     t0 = time.time()
     ref = Reference(np.asarray(y_target, dtype=np.float64), sr)
     duration = len(y_target) / sr

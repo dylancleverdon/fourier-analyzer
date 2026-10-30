@@ -667,6 +667,19 @@ class Optimizer:
         return moves
 
     # ------------------------------------------------------------------
+    def starting_point(self) -> Result:
+        """The patch before any search (for tuning only inside real Serum):
+        the analysis guess with the single-cycle custom wavetable. Our engine
+        renders it once, only to report its score."""
+        p = self.initial_patch()
+        cands = self.custom_table_patches(p)
+        p = dict(cands).get("single cycle", cands[0][1])
+        metrics = self.ref.all(self.render(p))
+        self.stages.append({"stage": "analysis guess + custom wavetable (no search in our engine)",
+                            "score": round(metrics["waveform_similarity"], 2), "table": "single cycle"})
+        return Result(patch=p, score=metrics["waveform_similarity"], details=metrics, notes=self.analysis.notes,
+                      bank=self.bank, history=[], used_custom=True, stages=self.stages, samples=self.samples)
+
     def run(self) -> Result:
         opts = self.opts
         p = self.initial_patch()

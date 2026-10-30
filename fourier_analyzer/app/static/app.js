@@ -627,7 +627,7 @@ $("#runRecon").onclick = async () => {
     target: parseFloat($("#target").value), time_budget: budgetSeconds(),
     keep_going: $("#keepGoing").checked, sidechain_in_preset: $("#scInPreset").checked,
     serum_tune: $("#serumTune").checked, serum_tune_minutes: parseFloat($("#serumTuneMin").value),
-    learn: $("#learnSerum").checked,
+    learn: $("#learnSerum").checked, serum_only: $("#serumOnly").checked,
     verify_serum: $("#verifySerum").checked,
   };
   if (!body.start && state.duration > 12 && !confirm("No selection: the whole stem will be used (only the first 6 s drive the search). Continue?")) return;
@@ -663,12 +663,16 @@ function showResult(r) {
   $("#scInfo").textContent = !sc ? "" : sc.detected
     ? `Sidechain detected from the ${sc.source}: -${sc.depth_db} dB duck, attack ${sc.attack_ms} ms, hold ${sc.hold_ms} ms, release ${sc.release_ms} ms (${sc.kicks_used} kicks). It was removed before fitting and is re-applied when comparing. ${r.sidechain_logic || ""}`
     : `No sidechain ducking found (${sc.reason || ""}).`;
+  const st = r.serum_tune;
+  const tuneLine = st && st.ok
+    ? `<div><b>Serum tuning${r.mode === "serum_only" ? " (Serum only)" : r.mode === "retune" ? ` (from result ${esc(r.from_result)})` : ""}:</b> real Serum score ${fmt(st.before, 1)}% → ${fmt(st.after, 1)}% · ${st.evals} renders in ${fmt(st.seconds, 0)} s (${fmt(st.evals / Math.max(st.seconds, 1), 2)} renders per second)</div>`
+    : st && st.error ? `<div class="muted">Serum tuning skipped: ${esc(st.error)}</div>` : "";
   const eg = r.engine_gap;
-  $("#engineGap").innerHTML = eg
+  $("#engineGap").innerHTML = tuneLine + (eg
     ? `<b>Our engine vs real Serum:</b> predicted ${fmt(eg.our_score, 1)}%, Serum scored ${fmt(eg.serum_score, 1)}%`
       + (eg.engine_similarity ? ` · the two renders are ${fmt(eg.engine_similarity.spectral_similarity, 1)}% alike` : "")
       + (eg.findings && eg.findings.length ? `<ul>${eg.findings.slice(0, 8).map((f) => `<li>${esc(f)}</li>`).join("")}</ul>` : "")
-    : "";
+    : "");
   $("#serumScore").textContent = r.serum && r.serum.ok ? `Real Serum 2 render: waveform similarity ${fmt(r.serum.score, 1)}%, spectral ${fmt(r.serum.details.spectral_similarity, 1)}%` : `Serum 2 check: ${r.serum ? r.serum.error : "not run"}`;
   const base = `/api/projects/${state.pid}/results/${r.id}/file/`;
   $("#aTarget").src = base + "target.wav";
@@ -679,6 +683,15 @@ function showResult(r) {
   $("#dlPreset").href = base + encodeURIComponent(preset); $("#dlPreset").download = preset;
   $("#dlMidi").href = base + "notes.mid"; $("#dlMidi").download = r.name + ".mid";
   $("#dlRender").href = base + "render.wav"; $("#dlRender").download = r.name + ".wav";
+  $("#retuneBtn").onclick = async () => {
+    const minutes = parseFloat($("#retuneMin").value);
+    $("#retuneBtn").disabled = true;
+    try {
+      const j = await post(`/api/projects/${state.pid}/results/${r.id}/retune`,
+        { minutes, learn: $("#learnSerum").checked, verify_serum: true });
+      pollJob(j.job, (job) => { $("#retuneBtn").disabled = false; if (job.result) { showResult(job.result); openProject(state.pid); } });
+    } catch (e) { $("#retuneBtn").disabled = false; alert("Could not start: " + e.message); }
+  };
   $("#installBtn").onclick = async () => { const x = await post(`/api/projects/${state.pid}/results/${r.id}/install`); alert("Installed:\n" + x.installed + "\n\nIn Serum 2 open the preset browser → User → Fourier Analyzer."); };
   $("#revealBtn").onclick = () => post(`/api/projects/${state.pid}/results/${r.id}/reveal`);
   $("#patchDesc").innerHTML = r.description.map((l) => `<li>${l}</li>`).join("");

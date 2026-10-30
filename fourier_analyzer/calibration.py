@@ -583,7 +583,7 @@ def record_run(*, patch: Patch, ours: np.ndarray, serum: np.ndarray, sr: int, no
                                f"difference between our engine and Serum (switching it off brings them to "
                                f"{c['gap_without']:.1f} %)")
     learned = []
-    if tuning and tuning.get("changes"):
+    if tuning and tuning.get("changes") and tuning.get("learnable", True):
         _, learned = learn(tuning["changes"])
         moved = sorted((c for c in tuning["changes"] if c["before"] and
                         (abs(math.log(max(c["after"], 1e-9) / max(c["before"], 1e-9))) > math.log(1.1)

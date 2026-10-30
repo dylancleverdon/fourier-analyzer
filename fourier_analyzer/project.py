@@ -373,8 +373,12 @@ def quick_analysis(pid: str, stem: str, start, end, bpm=None) -> dict:
     return s
 
 
-def tune_serum(job: Job, res, opt, bank, y44: np.ndarray, sc: dict, bpm: float, budget_s: float) -> None:
-    """Last stage: fine-tune the patch inside real Serum 2 (best effort)."""
+def tune_serum(job: Job, res, opt, bank, y44: np.ndarray, sc: dict, bpm: float, budget_s: float,
+               corrected: bool = False, span: tuple = (0.9, 0.91), learnable: bool = True) -> None:
+    """Fine-tune the patch inside real Serum 2 (best effort). ``corrected``:
+    the patch values are already what Serum gets (it came from a preset);
+    ``span``: the job progress range this stage covers; ``learnable``: its
+    parameter moves measure our engine's error (not a fit from scratch)."""
     from .analysis import sidechain as SC
     from .match.serum_tune import tune_in_serum
     from .serum.host import SerumHostError
@@ -384,7 +388,7 @@ def tune_serum(job: Job, res, opt, bank, y44: np.ndarray, sc: dict, bpm: float, 
         return
     n = int(round(opt.duration * 44100))
     y = y44[:n]
-    gain = SC.gain_curve(sc, len(y), 44100) if sc["detected"] else None
+    gain = SC.gain_curve(sc, len(y), 44100) if sc["detected"] and not ducks_itself(res.patch) else None
     notes = [nt for nt in (res.notes or opt.notes) if nt.start < opt.duration]
     job.set("serum tune", "Fine-tuning the patch inside the real Serum 2 plugin", budget=budget_s, elapsed=0,
             tune_after_stop=stopped_search)
@@ -393,19 +397,20 @@ def tune_serum(job: Job, res, opt, bank, y44: np.ndarray, sc: dict, bpm: float, 
 
     def prog(text, best, elapsed, extra):
         job.best = round(best, 2)
-        job.progress = min(0.91, 0.9 + 0.01 * elapsed / max(budget_s, 1))
+        job.progress = min(span[1], span[0] + (span[1] - span[0]) * elapsed / max(budget_s, 1))
         job.detail.update(extra)
         job.detail["activity"] = f"{extra['evals']} renders in Serum, best {best:.1f}%"
         if text:
             job.msg(text)
     try:
         patch, info = tune_in_serum(res.patch, bank, notes, y, 44100, budget_s, gain=gain, samples=res.samples,
-                                    stop=stop, progress=prog)
+                                    stop=stop, progress=prog, use_corrections=not corrected)
     except SerumHostError as e:
         job.msg(f"Serum tuning skipped: {e}")
         res.serum_tune = {"ok": False, "error": str(e)}
         return
     info.pop("details", None)
+    info["learnable"] = learnable
     res.serum_tune = info
     job.msg(f"Serum tuning: {info['before']}% -> {info['after']}% in real Serum "
             f"({info['evals']} renders, {info['seconds']:.0f} s)")
@@ -417,8 +422,15 @@ def tune_serum(job: Job, res, opt, bank, y44: np.ndarray, sc: dict, bpm: float, 
                            "note": f"real Serum score {info['before']} -> {info['after']}"})
 
 
+def ducks_itself(patch) -> bool:
+    """The patch contains an active LFO -> Voice Amp route (the sidechain
+    ducking written into the preset), so its renders are already ducked."""
+    return any(m.dest == "voiceamp" and m.source.startswith("lfo") and m.amount and not m.bypass
+               for m in patch.mods)
+
+
 def learn_from_serum(job: Job, res, opt, bank, notes, r44, serum_raw, y44, gain44, serum: dict, out: Path,
-                     meta: dict, budget_s: float) -> dict | None:
+                     meta: dict, budget_s: float, corrected: bool = False) -> dict | None:
     """Compare our render with Serum's render of the same preset, find which
     component causes the difference, log it and learn corrections."""
     from . import calibration
@@ -434,7 +446,7 @@ def learn_from_serum(job: Job, res, opt, bank, notes, r44, serum_raw, y44, gain4
     if budget_s > 0 and job.cancels < 2:
         dur = opt.duration
         nts = [nt for nt in notes if nt.start < dur]
-        corr = calibration.load_corrections()
+        corr = {"params": {}} if corrected else calibration.load_corrections()
         rnd = Renderer(bank, 44100, samples=res.samples)
         job.set("learning", "Learning from Serum: switching each component off in both engines",
                 budget=budget_s, elapsed=0)
@@ -471,13 +483,41 @@ def safe_name(name: str) -> str:
     return out or "untitled"
 
 
-def start_reconstruct(pid: str, stem: str, start, end, opts: dict) -> Job:
+def load_result_patch(pid: str, rid: str, bank, bpm: float):
+    """The patch of an earlier result, read back from its .SerumPreset (so it
+    is exactly what Serum played). Returns (patch, sample bank)."""
+    from .serum.mapping import state_to_patch
+    from .serum.preset import read_preset_bytes
+    from .synth.samples import SampleBank
+    out = project_dir(pid) / "results" / rid
+    src = next(out.glob("*.SerumPreset"), None)
+    if src is None:
+        raise ValueError(f"result {rid} has no preset")
+    _, st = read_preset_bytes(src.read_bytes())
+    samples = SampleBank()
+    return state_to_patch(st, bank, bpm=bpm, samples=samples), samples
+
+
+def load_result_report(pid: str, rid: str) -> dict:
+    p = project_dir(pid) / "results" / rid / "report.json"
+    if not p.exists():
+        raise ValueError(f"no result {rid}")
+    import json
+    return json.loads(p.read_text())
+
+
+def start_reconstruct(pid: str, stem: str, start, end, opts: dict, mode: str = "full",
+                      from_rid: str | None = None) -> Job:
+    """mode "full": search in our engine (then optionally tune in Serum);
+    "serum_only": skip our engine's search, tune only inside real Serum 2;
+    "retune": load result ``from_rid``'s preset and tune it further in Serum."""
     def work(job: Job):
         from .analysis.features import analyze
         from .export import write_midi, write_report
         from .match.ablation import run_checks
         from .match.metrics import METRIC_INFO
-        from .match.optimizer import OPT_SR, Options, Optimizer
+        from .match.optimizer import OPT_SR, Options, Optimizer, Result
+        from .synth.engine import Renderer as _R
         from .serum import host as serum_host
         from .serum.mapping import build_preset_bytes
         from .synth.engine import Renderer
@@ -528,9 +568,36 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict) -> Job:
                     "press Stop to finish with the best patch so far")
         opt = Optimizer(y22, OPT_SR, a, o, bank=bank, progress=prog, context_gain=gain22,
                         source_audio=(y44, 44100))
-        res = opt.run()
-        if opts.get("serum_tune", False) and float(opts.get("serum_tune_minutes") or 0) > 0:
-            tune_serum(job, res, opt, bank, y44, sc, bpm, float(opts["serum_tune_minutes"]) * 60)
+        corrected = False
+        if mode == "full":
+            res = opt.run()
+            if opts.get("serum_tune", False) and float(opts.get("serum_tune_minutes") or 0) > 0:
+                tune_serum(job, res, opt, bank, y44, sc, bpm, float(opts["serum_tune_minutes"]) * 60)
+        else:
+            serum_host._require_serum()          # these modes need the real plugin
+            if mode == "serum_only":
+                job.set("start", "Building the starting patch (analysis guess + custom wavetable)")
+                res = opt.starting_point()
+                job.msg(f"starting patch (no search in our engine): {res.score:.1f}% in our engine; "
+                        "everything else happens inside real Serum 2")
+                tune_serum(job, res, opt, bank, y44, sc, bpm, budget, span=(0.05, 0.9), learnable=False)
+            else:
+                job.set("start", f"Loading result {from_rid}")
+                patch, samples = load_result_patch(pid, from_rid, bank, bpm)
+                opt.samples = samples
+                opt.renderer = _R(bank, OPT_SR, samples=samples)
+                metrics = opt.ref.all(opt.render(patch))
+                res = Result(patch=patch, score=metrics["waveform_similarity"], details=metrics, notes=a.notes,
+                             bank=bank, stages=[{"stage": f"start: result {from_rid}",
+                                                 "score": round(metrics["waveform_similarity"], 2)}],
+                             samples=samples)
+                corrected = True
+                minutes = float(opts.get("serum_tune_minutes") or 5)
+                job.msg(f"tuning result {from_rid} in real Serum 2 for {minutes:g} min")
+                tune_serum(job, res, opt, bank, y44, sc, bpm, minutes * 60, corrected=True, span=(0.05, 0.9))
+            st = getattr(res, "serum_tune", None) or {}
+            if not st.get("ok"):
+                raise ValueError(f"tuning in Serum 2 failed: {st.get('error', 'no result')}")
         d = res.details
         job.msg(f"waveform similarity {d['waveform_similarity']}%, spectral similarity "
                 f"{d['spectral_similarity']}%, SI-SDR {d['si_sdr_db']} dB; running checks")
@@ -539,7 +606,7 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict) -> Job:
         checks = run_checks(res.patch, opt.y, OPT_SR, opt.notes, a.f0[: int(len(opt.y) / 256) + 1],
                             opt.renderer, opt.target, gain=opt.gain)
 
-        if sc["detected"]:
+        if sc["detected"] and not corrected:
             note = SC.add_to_patch(res.patch, sc, bpm, enabled=bool(opts.get("sidechain_in_preset", False)))
             if note:
                 job.msg(note)
@@ -550,7 +617,8 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict) -> Job:
         res.patch.name = name
         from . import calibration
         # learned corrections: the preset is written so real Serum sounds like our render
-        preset = build_preset_bytes(calibration.apply_corrections(res.patch), bank, name=name, samples=res.samples,
+        preset = build_preset_bytes(res.patch if corrected else calibration.apply_corrections(res.patch), bank,
+                                    name=name, samples=res.samples,
                                     description=f"Reconstructed by Fourier Analyzer, accuracy {res.score:.1f}")
         (out / f"{name}.SerumPreset").write_bytes(preset)
         write_midi(out / "notes.mid", a.notes, bpm)
@@ -581,9 +649,9 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict) -> Job:
         if learning and serum.get("ok") and raw_serum is not None:
             engine_gap = learn_from_serum(job, res, opt, bank, a.notes, r44, raw_serum, y44, gain44, serum,
                                           out, {"name": name, "stem": stem, "project": pid},
-                                          float(opts.get("learn_minutes") or 3) * 60)
+                                          float(opts.get("learn_minutes") or 3) * 60, corrected=corrected)
         summary = {
-            "id": rid, "stem": stem, "start": start, "end": end, "bpm": bpm, "name": name,
+            "id": rid, "mode": mode, "from_result": from_rid, "stem": stem, "start": start, "end": end, "bpm": bpm, "name": name,
             "accuracy": round(res.score, 2), "metric": "waveform_similarity", "details": res.details,
             "metric_info": METRIC_INFO, "target": o.target_score,
             "met_target": res.score >= o.target_score, "used_custom_wavetable": True,

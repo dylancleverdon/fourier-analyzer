@@ -89,6 +89,10 @@ There is deliberately no signing or checksum verification; update speed was prio
 
    7. **Fine-tune inside real Serum 2** (on by default, 2 min to 1 hour, skipped when Serum 2 isn't installed): the main search runs on the app's own copy of Serum's engine, which is fast but approximate. This stage keeps one copy of the real plugin open, renders candidate presets in it over and over, scores each against the original and nudges every continuous parameter with CMA-ES. It restarts whenever it converges, so it keeps working for the time you give it, and it never makes the result worse. The first **Stop** ends the main search and moves on to this stage; a second Stop ends it.
 
+   **Tune this patch in Serum 2** (under every result) loads that result's preset back into the real plugin and keeps tuning it for the time you pick (2 min to 2 hours). The outcome is saved as a new result; the original stays as it is.
+
+   **Serum only** (reconstruct option) skips the search in the app's engine: the analysis guess with a custom wavetable goes straight into real Serum 2, which is tuned for the whole search time. It shows how fast real Serum is on your machine; every result shows the renders per second.
+
    **Search time** goes from 1.5 min to 8 hours, a custom number of minutes, or **Until I stop it**. Tick **keep improving after reaching the target** so a long run doesn't stop at the similarity target.
 
    **Pitch and velocity go into the patch** where Serum would put them:

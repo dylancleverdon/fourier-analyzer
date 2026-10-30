@@ -145,6 +145,7 @@
               <div class="muted small">Runs over 15 min keep experimenting after the first full pass (new structures, filters, FX, restarts) and keep the best patch. Press Stop at any time to finish with the best one so far.</div>
             </div>
             <div class="opt checks">
+              <label class="check"><input id="serumOnly" type="checkbox"> <b>Serum only</b>: skip our engine and tune only inside real Serum 2 for the whole search time (slow; shows real Serum's speed)</label>
               <label class="check"><input id="keepGoing" type="checkbox"> keep improving after reaching the target</label>
               <label class="check"><input id="scInPreset" type="checkbox"> put detected sidechain ducking into the preset (LFO → Voice Amp)</label>
               <label class="check"><input id="serumTune" type="checkbox" checked> fine-tune inside real Serum 2 for
@@ -177,6 +178,12 @@
               <a id="dlMidi" class="btn">Download MIDI</a>
               <a id="dlRender" class="btn ghost">Render .wav</a>
               <button id="revealBtn" class="ghost">Show files</button>
+            </div>
+            <div class="actions retune">
+              <button id="retuneBtn" title="Load this result's preset into the real Serum 2 plugin and keep tuning it there. The outcome is saved as a new result; this one stays as it is.">Tune this patch in Serum 2</button>
+              <span>for</span>
+              <select id="retuneMin"><option value="2">2 min</option><option value="5" selected>5 min</option><option value="10">10 min</option><option value="20">20 min</option><option value="30">30 min</option><option value="60">1 hour</option><option value="120">2 hours</option></select>
+              <span class="muted small">Every candidate is rendered in real Serum 2; Stop keeps the best so far.</span>
             </div>
             <div class="grid2">
               <div><h4>Patch</h4><ul id="patchDesc" class="desc"></ul></div>

@@ -403,6 +403,7 @@ class RegionIn(BaseModel):
     sidechain_in_preset: bool = False   # write the detected ducking into the preset (LFO -> Voice Amp)
     serum_tune: bool = True             # fine-tune the finished patch inside real Serum 2
     serum_tune_minutes: float = 5.0
+    serum_only: bool = False            # skip our engine's search; tune only inside real Serum 2
     learn: bool = True                  # compare our engine with Serum, find causes, learn corrections
     learn_minutes: float = 3.0          # time for the culprit search
     verify_serum: bool = True
@@ -418,7 +419,29 @@ def analyze(pid: str, body: RegionIn):
 
 @app.post("/api/projects/{pid}/reconstruct")
 def reconstruct(pid: str, body: RegionIn):
-    job = project.start_reconstruct(pid, body.stem, body.start, body.end, body.model_dump())
+    job = project.start_reconstruct(pid, body.stem, body.start, body.end, body.model_dump(),
+                                    mode="serum_only" if body.serum_only else "full")
+    return {"job": job.id}
+
+
+class RetuneIn(BaseModel):
+    minutes: float = 5.0
+    learn: bool = True
+    verify_serum: bool = True
+
+
+@app.post("/api/projects/{pid}/results/{rid}/retune")
+def retune(pid: str, rid: str, body: RetuneIn):
+    """Put an existing result's patch back into real Serum 2 and keep tuning
+    it; the outcome is saved as a new result."""
+    try:
+        rep = project.load_result_report(pid, rid)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    opts = {"bpm": rep.get("bpm"), "serum_tune_minutes": body.minutes, "learn": body.learn,
+            "verify_serum": body.verify_serum, "target": rep.get("target", 90)}
+    job = project.start_reconstruct(pid, rep["stem"], rep.get("start"), rep.get("end"), opts,
+                                    mode="retune", from_rid=rid)
     return {"job": job.id}
 
 
