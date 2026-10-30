@@ -145,6 +145,9 @@
               <div class="muted small">Runs over 15 min keep experimenting after the first full pass (new structures, filters, FX, restarts) and keep the best patch. Press Stop at any time to finish with the best one so far.</div>
             </div>
             <div class="opt checks">
+              <label class="check"><input id="serumStructure" type="checkbox" checked> confirm structure in real Serum 2: the top
+                <input id="serumFinalists" type="number" min="1" max="12" step="1" value="3" style="width:3.5em"> candidates per round are rendered in Serum and a part is only kept if Serum agrees; Serum time
+                <select id="serumStructMin"><option value="2">2 min</option><option value="5" selected>5 min</option><option value="10">10 min</option><option value="20">20 min</option><option value="30">30 min</option><option value="60">1 hour</option></select></label>
               <label class="check"><input id="serumOnly" type="checkbox"> <b>Serum only</b>: skip our engine and tune only inside real Serum 2 for the whole search time (slow; shows real Serum's speed)</label>
               <label class="check"><input id="keepGoing" type="checkbox"> keep improving after reaching the target</label>
               <label class="check"><input id="scInPreset" type="checkbox"> put detected sidechain ducking into the preset (LFO → Voice Amp)</label>

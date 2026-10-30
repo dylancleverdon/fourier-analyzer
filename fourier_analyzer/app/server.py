@@ -404,6 +404,9 @@ class RegionIn(BaseModel):
     serum_tune: bool = True             # fine-tune the finished patch inside real Serum 2
     serum_tune_minutes: float = 5.0
     serum_only: bool = False            # skip our engine's search; tune only inside real Serum 2
+    serum_structure: bool = True        # confirm structure decisions in real Serum 2 (when installed)
+    serum_finalists: int = 3            # candidates per round rendered in real Serum
+    serum_structure_minutes: float = 5.0  # real-Serum time for structure decisions
     learn: bool = True                  # compare our engine with Serum, find causes, learn corrections
     learn_minutes: float = 3.0          # time for the culprit search
     verify_serum: bool = True

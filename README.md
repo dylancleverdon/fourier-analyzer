@@ -82,7 +82,8 @@ There is deliberately no signing or checksum verification; update speed was prio
       - OTT, EQ and glide
       - unison detune modes, warps on osc B and C, amp-envelope curve shapes and hold
       - **sample, granular and spectral oscillators** playing a note cut from the original (in place of osc A or as an extra layer); the audio is embedded in the preset
-   3. **Pruning** removes each component in turn and drops it if the fit holds.
+      With **confirm structure in real Serum 2** (on by default; used when Serum 2 is installed), each round's top candidates (3 by default, adjustable) are also rendered in the real plugin through one persistent Serum session, and a part is only kept if real Serum agrees it helps. Serum's renders are scored with the same measure as the search, so the two are compared like for like. If Serum isn't available, or its time runs out (its own budget in the reconstruct options), the app's engine decides alone.
+   3. **Pruning** removes each component in turn and drops it if the fit holds (confirmed in real Serum 2 too, when available).
    4. **Fine-tuning** of every parameter with CMA-ES.
    5. **Exploration** (search times over 15 min): after the first full pass (about 15 min), the search keeps experimenting until the time runs out: fresh rounds of structure moves, pruning and CMA-ES restarts, keeping only what improves the fit.
    6. **Waveform alignment**: start phase, fine tune, the amp envelope and each note's start time (±6 ms) are tuned to maximise literal waveform correlation. The refined note timing also goes into the exported MIDI.
@@ -91,7 +92,7 @@ There is deliberately no signing or checksum verification; update speed was prio
 
    **Tune this patch in Serum 2** (under every result) loads that result's preset back into the real plugin and keeps tuning it for the time you pick (2 min to 2 hours). The outcome is saved as a new result; the original stays as it is.
 
-   **Serum only** (reconstruct option) skips the search in the app's engine: the analysis guess with a custom wavetable goes straight into real Serum 2, which is tuned for the whole search time. It shows how fast real Serum is on your machine; every result shows the renders per second.
+   **Serum only** (reconstruct option) skips tuning in the app's engine: starting from the analysis guess with a custom wavetable, parts are screened in the app's engine but only added or removed when real Serum 2 agrees (for the Serum time set in the options), then the parameters are tuned in Serum for the rest of the search time. It shows how fast real Serum is on your machine; every result shows the renders per second.
 
    **Search time** goes from 1.5 min to 8 hours, a custom number of minutes, or **Until I stop it**. Tick **keep improving after reaching the target** so a long run doesn't stop at the similarity target.
 
@@ -135,6 +136,8 @@ For each run it:
 - **finds the cause**: every part of the patch (each FX module, filter, warp, unison, oscillator, noise, sub, matrix route, glide) is switched off in both engines in turn; the part whose removal closes the gap is the one emulated wrongly;
 - **learns corrections**: the Serum tuning stage shows how far each parameter had to move to match the original in real Serum. Once at least 5 runs agree on the same offset for a parameter (for example "lp24 cutoff needs ×1.18"), that correction is applied to every preset the app writes;
 - **logs everything** as numbers only (no audio) in `~/Library/Application Support/FourierAnalyzer/data/calibration/`, and writes `engine_gap.txt` next to each result.
+
+Every structure decision checked in real Serum (our engine's score change vs Serum's, and whether they agreed) is logged too; the parts where Serum disagrees most are listed first on the Engine accuracy page.
 
 **Engine accuracy** (top bar) shows the totals: the score drop between our prediction and real Serum, the biggest causes across all runs, the features with the largest drop, the average band differences and the corrections in use. **Export report** saves it all as one JSON file to send in for engine fixes; **Reset corrections** forgets the learned corrections.
 

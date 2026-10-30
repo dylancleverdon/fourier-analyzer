@@ -75,6 +75,49 @@ def reset_corrections() -> None:
     save_corrections({"params": {}, "pending": {}, "history": []})
 
 
+def checks_path() -> Path:
+    return cal_dir() / "structure_checks.jsonl"
+
+
+def part_kind(name: str) -> str:
+    """'LFO1 (sine, 1/8) -> filter.cutoff' -> 'LFO -> filter.cutoff': one row
+    per kind of part on the Engine accuracy page."""
+    import re
+    k = re.sub(r"\([^)]*\)", "", name)
+    k = re.sub(r"\b(on|from) osc [ABC]\b", "", k)
+    k = re.sub(r"\bx\d+\b", "", k)
+    k = re.sub(r"[+-]?\d+(\.\d+)?(\s?(st|ct|ms|Hz)\b|%)?", "", k)
+    return re.sub(r"\s+", " ", k).strip(" :") or name
+
+
+def record_checks(rows: list[dict], meta: dict | None = None) -> None:
+    """Structure decisions checked in real Serum 2 (our engine's verdict vs
+    Serum's). The disagreements are evidence of what our engine gets wrong."""
+    if not rows:
+        return
+    try:
+        with checks_path().open("a") as fh:
+            for r in rows:
+                fh.write(json.dumps({"t": time.time(), **(meta or {}), **r, "kind_of_part": part_kind(r["part"])},
+                                    default=_jsonable) + "\n")
+    except OSError as e:
+        log.warning("could not write the structure-check log: %s", e)
+
+
+def read_checks() -> list[dict]:
+    try:
+        lines = checks_path().read_text().splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            pass
+    return out
+
+
 def read_log(limit: int | None = None) -> list[dict]:
     try:
         lines = log_path().read_text().splitlines()
@@ -676,7 +719,16 @@ def summary() -> dict:
         for b in r.get("engine_gap", {}).get("bands", []):
             bands.setdefault(b["hz"], []).append(b["diff_db"])
     corr = load_corrections()
+    by_part: dict[str, list] = {}
+    for c in read_checks():
+        by_part.setdefault(f"{'add' if c.get('kind') == 'add' else 'remove'}: {c.get('kind_of_part', c.get('part'))}",
+                           []).append(c)
+    structure = sorted(({"part": k, "checks": len(v), "disagreed": sum(not c["agreed"] for c in v),
+                         "avg_engine_delta": round(float(np.mean([c["engine_delta"] for c in v])), 2),
+                         "avg_serum_delta": round(float(np.mean([c["serum_delta"] for c in v])), 2)}
+                        for k, v in by_part.items()), key=lambda x: (-x["disagreed"], -x["checks"]))
     return {
+        "structure_checks": structure[:30],
         "runs": len(recs),
         "avg_drop": round(float(np.mean([r.get("score_drop", 0) for r in recs])), 2) if recs else None,
         "avg_engine_similarity": round(float(np.mean([r["engine_gap"]["similarity"]["spectral_similarity"]

@@ -73,3 +73,18 @@ def test_culprit_search_points_at_the_mis_emulated_part():
                                     render_ours=lambda q: r.render(q, notes, 0.7), build=lambda q: q)
     assert res["components"][0]["component"] == "FX chorus", res
     assert res["components"][0]["explains"] > 0
+
+
+def test_structure_disagreements_are_logged_by_kind_of_part():
+    rows = [
+        {"kind": "add", "part": "FX reverb", "engine_delta": 2.0, "serum_delta": -1.0, "agreed": False},
+        {"kind": "add", "part": "FX reverb", "engine_delta": 1.5, "serum_delta": 0.8, "agreed": True},
+        {"kind": "add", "part": "LFO1 (sine, 1/8) -> filter.cutoff", "engine_delta": 1.0, "serum_delta": 1.2,
+         "agreed": True},
+        {"kind": "remove", "part": "unison x3", "engine_delta": 0.0, "serum_delta": -2.0, "agreed": False},
+    ]
+    calibration.record_checks(rows, {"project": "p"})
+    s = {r["part"]: r for r in calibration.summary()["structure_checks"]}
+    assert s["add: FX reverb"]["checks"] >= 2 and s["add: FX reverb"]["disagreed"] >= 1
+    assert "add: LFO -> filter.cutoff" in s
+    assert s["remove: unison"]["disagreed"] >= 1

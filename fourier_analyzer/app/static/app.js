@@ -628,6 +628,8 @@ $("#runRecon").onclick = async () => {
     keep_going: $("#keepGoing").checked, sidechain_in_preset: $("#scInPreset").checked,
     serum_tune: $("#serumTune").checked, serum_tune_minutes: parseFloat($("#serumTuneMin").value),
     learn: $("#learnSerum").checked, serum_only: $("#serumOnly").checked,
+    serum_structure: $("#serumStructure").checked, serum_finalists: parseInt($("#serumFinalists").value, 10) || 3,
+    serum_structure_minutes: parseFloat($("#serumStructMin").value),
     verify_serum: $("#verifySerum").checked,
   };
   if (!body.start && state.duration > 12 && !confirm("No selection: the whole stem will be used (only the first 6 s drive the search). Continue?")) return;
@@ -695,7 +697,15 @@ function showResult(r) {
   $("#installBtn").onclick = async () => { const x = await post(`/api/projects/${state.pid}/results/${r.id}/install`); alert("Installed:\n" + x.installed + "\n\nIn Serum 2 open the preset browser → User → Fourier Analyzer."); };
   $("#revealBtn").onclick = () => post(`/api/projects/${state.pid}/results/${r.id}/reveal`);
   $("#patchDesc").innerHTML = r.description.map((l) => `<li>${l}</li>`).join("");
-  $("#stages").innerHTML = r.stages.map((s) => `<li><b>${s.stage}</b>: ${fmt(s.score, 1)}${s.table ? " · " + s.table : ""}${s.steps && s.steps.length ? "<br><span class='muted small'>" + s.steps.map((x) => (x.added ? "+ " + x.added : "− " + x.removed) + " → " + fmt(x.score, 1)).join("<br>") + "</span>" : ""}</li>`).join("");
+  const stepText = (x) => (x.added ? "+ " + esc(x.added) : "− " + esc(x.removed)) + " → " + fmt(x.score, 1)
+    + (x.serum != null ? ` (real Serum ${fmt(x.serum_before, 1)} → ${fmt(x.serum, 1)}, agreed)` : "");
+  const checkText = (c) => `${c.kind === "add" ? "+" : "−"} ${esc(c.part)}: our engine ${fmt(c.engine_before, 1)} → ${fmt(c.engine_after, 1)}, `
+    + `real Serum ${fmt(c.serum_before, 1)} → ${fmt(c.serum_after, 1)} · ${c.agreed ? "Serum agreed" : "<b>Serum disagreed</b>"}${c.kind === "add" ? (c.accepted ? " · added" : " · not added") : (c.accepted ? " · removed" : " · kept")}`;
+  $("#stages").innerHTML = r.stages.map((s) => `<li><b>${esc(s.stage)}</b>: ${fmt(s.score, 1)}${s.table ? " · " + esc(s.table) : ""}`
+    + (s.steps && s.steps.length ? "<br><span class='muted small'>" + s.steps.map(stepText).join("<br>") + "</span>" : "")
+    + (s.serum_checks && s.serum_checks.length ? "<br><span class='small'>Checked in real Serum 2:<br>" + s.serum_checks.map(checkText).join("<br>") + "</span>" : "")
+    + "</li>").join("")
+    + (r.serum_structure ? `<li class="muted small">Real Serum 2 structure checks: ${r.serum_structure.checks.length} decisions, ${r.serum_structure.agreed} agreed, ${r.serum_structure.renders} renders in ${fmt(r.serum_structure.seconds, 0)} s${r.serum_structure.error ? " · " + esc(r.serum_structure.error) : ""}</li>` : "");
   $("#checks").innerHTML = r.checks.map((c) => `<li class="st-${c.status}"><b>${c.name}</b>: ${c.detail}${c.note ? ` <span class="muted">(${c.note})</span>` : ""}</li>`).join("");
 }
 
@@ -776,10 +786,11 @@ document.addEventListener("keydown", (e) => {
 async function showEngine() {
   const s = await api("/api/calibration");
   const body = $("#engineBody");
-  if (!s.runs) { body.innerHTML = "<p>No runs verified in Serum 2 yet. Reconstruct a sound with <b>learn from Serum</b> ticked.</p>"; return; }
+  if (!s.runs && !(s.structure_checks || []).length) { body.innerHTML = "<p>No runs verified in Serum 2 yet. Reconstruct a sound with <b>learn from Serum</b> ticked.</p>"; return; }
   const rows = (arr, cols) => `<table class="small"><tr>${cols.map((c) => `<th>${c[0]}</th>`).join("")}</tr>${arr.map((x) => `<tr>${cols.map((c) => `<td>${esc(String(c[1](x)))}</td>`).join("")}</tr>`).join("")}</table>`;
   body.innerHTML = `<p><b>${s.runs}</b> runs logged. On average real Serum scores <b>${fmt(s.avg_drop, 2)}</b> points ${s.avg_drop >= 0 ? "below" : "above"} our prediction; our renders and Serum's are ${fmt(s.avg_engine_similarity, 1)}% alike.</p>`
     + `<h4>Biggest causes (switching the part off closes the gap by)</h4>` + (s.culprits.length ? rows(s.culprits.slice(0, 10), [["Part", (x) => x.component], ["Runs", (x) => x.runs], ["Avg. gap explained", (x) => fmt(x.avg_explains, 2) + " %"]]) : "<p class='muted small'>none yet</p>")
+    + (s.structure_checks && s.structure_checks.length ? `<h4>Structure decisions checked in real Serum 2 (where it disagreed with our engine)</h4>` + rows(s.structure_checks.slice(0, 12), [["Part", (x) => x.part], ["Checks", (x) => x.checks], ["Serum disagreed", (x) => x.disagreed], ["Our engine Δ", (x) => fmt(x.avg_engine_delta, 2)], ["Serum Δ", (x) => fmt(x.avg_serum_delta, 2)]]) : "")
     + `<h4>Features with the largest score drop</h4>` + rows(s.features.slice(0, 10), [["Feature", (x) => x.feature], ["Runs", (x) => x.runs], ["Avg. drop", (x) => fmt(x.avg_drop, 2)]])
     + `<h4>Frequency bands (Serum minus ours, average)</h4>` + rows(s.bands.filter((b) => Math.abs(b.avg_diff_db) >= 1), [["Band", (x) => x.hz + " Hz"], ["Diff.", (x) => fmt(x.avg_diff_db, 1) + " dB"], ["Runs", (x) => x.runs]])
     + `<h4>Corrections applied to presets</h4>` + (s.corrections.length ? rows(s.corrections, [["Parameter", (x) => x.key], ["Correction", (x) => x.kind === "ratio" ? "×" + fmt(x.value, 3) : (x.value >= 0 ? "+" : "") + fmt(x.value, 4)], ["From runs", (x) => x.runs]]) : "<p class='muted small'>none yet (a parameter needs 5 runs that agree)</p>")

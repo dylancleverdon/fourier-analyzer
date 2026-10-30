@@ -70,6 +70,10 @@ def test_full_flow(monkeypatch):
     assert {"waveform_similarity", "spectral_similarity", "si_sdr_db"} <= set(res["details"])
     assert "sidechain" in res and res["patch"]["oscs"][0]["table"].startswith("custom:")
     assert res["serum_tune"]["ok"] and res["serum_tune"]["evals"] > 5, res["serum_tune"]
+    # structure decisions were put to (stand-in) Serum through the persistent session
+    ss = res["serum_structure"]
+    assert ss and ss["error"] is None and isinstance(ss["checks"], list), ss
+    assert any("serum_checks" in st for st in res["stages"])
     assert res["serum_tune"]["after"] >= res["serum_tune"]["before"]
     assert res["serum"]["ok"], res["serum"]
     # learning from Serum: engine gap documented, culprits searched, nothing audio in the log
@@ -97,7 +101,10 @@ def test_full_flow(monkeypatch):
     assert j["status"] == "done", j.get("error")
     r3 = j["result"]
     assert r3["mode"] == "serum_only" and r3["serum_tune"]["evals"] > 5
-    assert not any(s["stage"] in ("structure search", "fine-tune") for s in r3["stages"])
+    assert not any(s["stage"] == "fine-tune" for s in r3["stages"])
+    for st in r3["stages"]:                      # Serum only: nothing added on our engine's word alone
+        for step in st.get("steps", []):
+            assert step.get("agreed"), step
 
 
 def test_cancel_job():

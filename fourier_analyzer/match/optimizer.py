@@ -109,6 +109,8 @@ class Optimizer:
         self._source_sid: str | None = None
         self._source_root = 60.0
         self.renderer = Renderer(self.bank, OPT_SR, samples=self.samples)
+        self._judge = None             # SerumJudge: real Serum 2 confirms structure decisions
+        self._serum_p, self._serum_s = None, 0.0
         self.notes = [nt for nt in analysis.notes if nt.start < self.duration]
         self.t0 = time.time()
         self.best_score = -1.0
@@ -703,62 +705,11 @@ class Optimizer:
         self.stages.append({"stage": "custom wavetable", "score": round(score, 2), "table": label,
                             "candidates": [{"table": t, "score": round(s, 2)} for s, t, _ in results]})
 
-        # --- 3. greedy structure search -------------------------------------
-        added = []
-        while self.pass_left() > (self.pass_end - self.t0) * 0.07 and score < 99.0:
-            if added and not opts.keep_going and self.ref.waveform(self.render(p)) >= opts.target_score:
-                break
-            moves = self.structure_moves(p)
-            self.set_stage("structure", f"screening {len(moves)} possible additions")
-            # quick screen: one render per candidate so every move gets a look
-            # however many there are, then a short tune of the top dozen
-            quick = []
-            for name, fn, focus in moves:
-                if self.pass_left() < (self.pass_end - self.t0) * 0.06:
-                    break
-                self.activity = f"screening: {name}"
-                q = fn(p.copy())
-                quick.append((self.evaluate(q), name, q, focus))
-            quick.sort(key=lambda r: -r[0])
-            screened = []
-            for _, name, q, focus in quick[:12]:
-                if self.pass_left() < (self.pass_end - self.t0) * 0.06:
-                    break
-                self.activity = f"short tune: {name}"
-                q, s = self.tune(q, 12, focus=focus, sigma=0.2)
-                screened.append((s, name, q, focus))
-            screened.sort(key=lambda r: -r[0])
-            best = (score, None, None)
-            for s0, name, q, focus in screened[:4]:
-                if self.pass_left() < (self.pass_end - self.t0) * 0.06:
-                    break
-                self.activity = f"testing best candidate: {name}"
-                q, s = self.tune(q, 48, focus=focus | {"filter", "osc", "env"}, sigma=0.1)
-                if s > best[0] + 0.25:
-                    best = (s, name, q)
-            if best[1] is None:
-                break
-            score, name, p = best
-            added.append({"added": name, "score": round(score, 2)})
-            self.report("structure", f"kept '{name}' -> {score:.1f}")
-        self.stages.append({"stage": "structure search", "score": round(score, 2), "steps": added})
+        # --- 3. greedy structure search (finalists confirmed in real Serum) --
+        p, score = self.structure_search(p, score)
 
         # --- 4. pruning (ablation) ------------------------------------------
-        self.set_stage("prune", "removing components that do not help")
-        removed = []
-        changed = True
-        while changed and self.pass_left() > (self.pass_end - self.t0) * 0.03:
-            changed = False
-            for name, fn in self.prune_moves(p):
-                q = fn(p.copy())
-                s = self.evaluate(q)
-                if s >= score - 0.3:
-                    p, score = q, s
-                    removed.append({"removed": name, "score": round(s, 2)})
-                    self.report("prune", f"removed unnecessary {name} -> {s:.1f}")
-                    changed = True
-                    break
-        self.stages.append({"stage": "pruning", "score": round(score, 2), "steps": removed})
+        p, score = self.prune(p, score)
 
         # --- 5. fine-tune ----------------------------------------------------
         budget = int(max(40, self.pass_left() * 0.9 / 0.03))
@@ -798,13 +749,220 @@ class Optimizer:
         return Result(patch=p, score=total, details=metrics, notes=self.analysis.notes, bank=self.bank,
                       history=self.history, used_custom=True, stages=self.stages, samples=self.samples)
 
+    # ------------------------------------------------------------------
+    # real Serum 2 as the judge of structure decisions (see serum_judge.py)
+
+    @property
+    def judge(self):
+        return self._judge
+
+    @judge.setter
+    def judge(self, j) -> None:
+        """Attach a SerumJudge; it scores Serum's renders with this search's
+        own measure (at this search's sample rate) so the two compare."""
+        self._judge = j
+        self._serum_p = None
+        if j is not None:
+            j.scorer = self.score_signal_from(j.sr)
+
+    def score_signal_from(self, sr: int):
+        from ..audio import resample
+
+        def score(y: np.ndarray) -> float:
+            y = np.asarray(y, dtype=np.float64)
+            if sr != OPT_SR:
+                y = resample(y, sr, OPT_SR)
+            n = len(self.y)
+            y = np.pad(y[:n], (0, max(0, n - len(y))))
+            if not np.all(np.isfinite(y)):
+                return 0.0
+            return 0.5 * self.target.score(y) + 0.5 * self.ref.spectral(y)
+        return score
+
+    def _serum_base(self, p: Patch) -> float | None:
+        """Real-Serum score of the current patch (kept until the patch changes)."""
+        if self.judge is None:
+            return None
+        if self._serum_p is not p:
+            r = self.judge.score(p)
+            if r is None:
+                return None
+            self._serum_p, self._serum_s = p, r[0]
+        return self._serum_s
+
+    def serum_check(self, kind: str, name: str, p: Patch, score: float, q: Patch, s: float,
+                    focus: set | None = None):
+        """Ask real Serum about one change our engine likes ("add" or
+        "remove"). Returns (row, q, s, serum score); row is None when Serum
+        could not be asked (not installed, failed or out of time)."""
+        from .serum_judge import AGREE_MARGIN
+        if self.judge is None or not self.judge.available():
+            return None, q, s, None
+        base = self._serum_base(p)
+        if base is None:
+            return None, q, s, None
+        self.activity = f"checking in real Serum 2: {name}"
+        r = self.judge.score(q)
+        if r is None:
+            return None, q, s, None
+        ss = r[0]
+        if kind == "add":
+            ok = ss > base + AGREE_MARGIN
+            if not ok and focus and self.judge.tune_renders:
+                self.activity = f"short tune-up in real Serum 2: {name}"
+                q2, ss2 = self.judge.tune_up(q, focus, ss)
+                if ss2 > ss:
+                    q, ss = q2, ss2
+                    s = self.evaluate(q)
+                    ok = ss > base + AGREE_MARGIN
+        else:
+            ok = ss >= base - AGREE_MARGIN
+        row = self.judge.note(kind, name, score, s, base, ss, accepted=False)
+        verb = "adding" if kind == "add" else "removing"
+        self.report(self.stage, f"{verb} '{name}': our engine {score:.1f} -> {s:.1f}, real Serum "
+                                f"{base:.1f} -> {ss:.1f}: {'Serum agrees' if ok else 'Serum disagrees'}")
+        row["ok"] = bool(ok)
+        return row, q, s, ss
+
+    def _accept_serum(self, q: Patch, ss: float | None) -> None:
+        if ss is not None:
+            self._serum_p, self._serum_s = q, ss
+
+    def structure_search(self, p: Patch, score: float, require_serum: bool = False) -> tuple[Patch, float]:
+        """Greedy additions: every possible part is screened in our engine
+        (one render, then a short tune of the top dozen, then a longer tune of
+        the best four); the finalists are rendered in real Serum 2 and a part
+        is kept only if Serum agrees. ``require_serum``: never add on our
+        engine's word alone (Serum-only mode)."""
+        opts = self.opts
+        added, checks = [], []
+        floor = (self.pass_end - self.t0) * 0.07
+        while self.pass_left() > floor and score < 99.0:
+            if added and not opts.keep_going and self.ref.waveform(self.render(p)) >= opts.target_score:
+                break
+            if require_serum and (self.judge is None or not self.judge.available()):
+                break
+            moves = self.structure_moves(p)
+            self.set_stage("structure", f"screening {len(moves)} possible additions")
+            # quick screen: one render per candidate so every move gets a look
+            # however many there are, then a short tune of the top dozen
+            quick = []
+            for name, fn, focus in moves:
+                if self.pass_left() < floor * 0.85:
+                    break
+                self.activity = f"screening: {name}"
+                q = fn(p.copy())
+                quick.append((self.evaluate(q), name, q, focus))
+            quick.sort(key=lambda r: -r[0])
+            screened = []
+            for _, name, q, focus in quick[:12]:
+                if self.pass_left() < floor * 0.85:
+                    break
+                self.activity = f"short tune: {name}"
+                q, s = self.tune(q, 12, focus=focus, sigma=0.2)
+                screened.append((s, name, q, focus))
+            screened.sort(key=lambda r: -r[0])
+            tested = []
+            for s0, name, q, focus in screened[:4]:
+                if self.pass_left() < floor * 0.85:
+                    break
+                self.activity = f"testing best candidate: {name}"
+                q, s = self.tune(q, 48, focus=focus | {"filter", "osc", "env"}, sigma=0.1)
+                tested.append((s, name, q, focus))
+            improvers = sorted((t for t in tested if t[0] > score + 0.25), key=lambda t: -t[0])
+            if not improvers:
+                break
+            # finalists in real Serum: the one Serum likes best among those it agrees with
+            n_final = self.judge.finalists if self.judge is not None else 0
+            judged, choice = 0, None
+            for s, name, q, focus in improvers[:max(1, n_final)]:
+                row, q, s, ss = self.serum_check("add", name, p, score, q, s, focus)
+                if row is None:
+                    break
+                judged += 1
+                checks.append(row)
+                if row["ok"] and (choice is None or ss > choice[3]):
+                    choice = (s, name, q, ss, row)
+            if judged == 0:
+                if require_serum:
+                    break
+                s, name, q, _ = improvers[0]          # Serum not available: our engine decides
+                p, score = q, s
+                added.append({"added": name, "score": round(score, 2)})
+                self.report("structure", f"kept '{name}' -> {score:.1f}")
+                continue
+            if choice is None:
+                self.report("structure", "real Serum 2 rejected every finalist; structure search ends")
+                break
+            s, name, q, ss, row = choice
+            row["accepted"] = True
+            p, score = q, s
+            self._accept_serum(q, ss)
+            added.append({"added": name, "score": round(score, 2), "serum_before": row["serum_before"],
+                          "serum": row["serum_after"], "agreed": True})
+            self.report("structure", f"kept '{name}' -> {score:.1f} (real Serum {row['serum_after']:.1f})")
+        self.stages.append({"stage": "structure search", "score": round(score, 2), "steps": added,
+                            "serum_checks": checks})
+        return p, score
+
+    def prune(self, p: Patch, score: float, require_serum: bool = False) -> tuple[Patch, float]:
+        """Remove parts that do not help; a removal our engine allows is
+        confirmed in real Serum 2 (the score must hold there too)."""
+        self.set_stage("prune", "removing components that do not help")
+        removed, checks, refused = [], [], set()
+        changed = True
+        while changed and self.pass_left() > (self.pass_end - self.t0) * 0.03:
+            changed = False
+            for name, fn in self.prune_moves(p):
+                if name in refused:
+                    continue
+                q = fn(p.copy())
+                s = self.evaluate(q)
+                if s < score - 0.3:
+                    continue
+                row, q, s, ss = self.serum_check("remove", name, p, score, q, s)
+                if row is None and require_serum:
+                    continue
+                if row is not None:
+                    checks.append(row)
+                    if not row["ok"]:
+                        refused.add(name)
+                        continue
+                    row["accepted"] = True
+                    self._accept_serum(q, ss)
+                p, score = q, s
+                step = {"removed": name, "score": round(s, 2)}
+                if row is not None:
+                    step.update(serum_before=row["serum_before"], serum=row["serum_after"], agreed=True)
+                removed.append(step)
+                self.report("prune", f"removed unnecessary {name} -> {s:.1f}")
+                changed = True
+                break
+        self.stages.append({"stage": "pruning", "score": round(score, 2), "steps": removed, "serum_checks": checks})
+        return p, score
+
+    def run_serum_only(self) -> Result:
+        """Serum-only mode: no tuning in our engine beyond screening; parts are
+        added and removed only when real Serum 2 agrees. The parameters are
+        tuned in Serum afterwards (project.tune_serum)."""
+        res = self.starting_point()
+        p = res.patch
+        score = self.evaluate(p)
+        if self.judge is not None:
+            p, score = self.structure_search(p, score, require_serum=True)
+            p, score = self.prune(p, score, require_serum=True)
+        metrics = self.ref.all(self.render(p))
+        return Result(patch=p, score=metrics["waveform_similarity"], details=metrics, notes=self.analysis.notes,
+                      bank=self.bank, history=self.history, used_custom=True, stages=self.stages,
+                      samples=self.samples)
+
     def _explore(self, p: Patch, score: float) -> tuple[Patch, float]:
         """Extra time beyond the standard schedule: repeated rounds of structure
         search (every candidate gets a short tune), pruning and CMA-ES restarts
         from the best patch. Only improvements are kept."""
         opts = self.opts
         self.reserve = self.wave_reserve
-        rounds = []
+        rounds, checks = [], []
         r = 0
         while self.time_left() > self.wave_reserve + 20 and score < 99.5:
             if not opts.keep_going and self.ref.waveform(self.render(p)) >= opts.target_score:
@@ -827,12 +985,26 @@ class Optimizer:
                 self.activity = f"round {r}: tuning {name}"
                 q, s = self.tune(q, 120, focus=focus | {"filter", "osc", "env", "mod"}, sigma=0.1)
                 if s > score + 0.15:
+                    row, q, s, ss = self.serum_check("add", name, p, score, q, s, focus)
+                    if row is not None:
+                        checks.append(row)
+                        if not row["ok"]:
+                            continue
+                        row["accepted"] = True
+                        self._accept_serum(q, ss)
                     p, score = q, s
                     self.report("explore", f"round {r}: kept '{name}' -> {score:.1f}")
             for name, fn in self.prune_moves(p):
                 q = fn(p.copy())
                 s = self.evaluate(q)
                 if s >= score - 0.1:
+                    row, q, s, ss = self.serum_check("remove", name, p, score, q, s)
+                    if row is not None:
+                        checks.append(row)
+                        if not row["ok"]:
+                            continue
+                        row["accepted"] = True
+                        self._accept_serum(q, ss)
                     p, score = q, s
             # restart the full optimisation from the best patch (wider, then narrower)
             for sigma in (0.15, 0.05):
@@ -846,7 +1018,8 @@ class Optimizer:
             rounds.append({"round": r, "score": round(score, 2), "gain": round(score - start_score, 2)})
             self.report("explore", f"round {r} done: {score:.1f}")
         if rounds:
-            self.stages.append({"stage": "exploration", "score": round(score, 2), "rounds": rounds})
+            self.stages.append({"stage": "exploration", "score": round(score, 2), "rounds": rounds,
+                                "serum_checks": checks})
         self.reserve = 0.0
         return p, score
 

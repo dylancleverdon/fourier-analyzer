@@ -422,6 +422,28 @@ def tune_serum(job: Job, res, opt, bank, y44: np.ndarray, sc: dict, bpm: float, 
                            "note": f"real Serum score {info['before']} -> {info['after']}"})
 
 
+def make_judge(job: Job, opt, bank, y44, sc: dict, opts: dict, budget_s: float):
+    """Real Serum 2 as the judge of structure decisions (None when it is not
+    installed: the search then runs on our engine alone)."""
+    from .analysis import sidechain as SC
+    from .match.serum_judge import SerumJudge
+    from .serum import host as serum_host
+    try:
+        serum_host._require_serum()
+    except serum_host.SerumHostError as e:
+        job.msg(f"structure search in our engine only: {e}")
+        return None
+    n = int(round(opt.duration * 44100))
+    y = y44[:n]
+    gain = SC.gain_curve(sc, len(y), 44100) if sc["detected"] else None
+    notes = [nt for nt in opt.notes if nt.start < opt.duration]
+    finalists = int(opts.get("serum_finalists") or 3)
+    job.msg(f"structure decisions confirmed in real Serum 2: top {finalists} candidates per round, "
+            f"up to {budget_s / 60:.0f} min of Serum time")
+    return SerumJudge(bank, opt.samples, notes, y, 44100, budget_s, gain=gain,
+                      stop=lambda: job.cancel_requested, finalists=finalists)
+
+
 def ducks_itself(patch) -> bool:
     """The patch contains an active LFO -> Voice Amp route (the sidechain
     ducking written into the preset), so its renders are already ducked."""
@@ -560,7 +582,10 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict, mode: str = "
         budget = float(opts.get("time_budget") or 0)
         if budget <= 0:                       # "until I stop it"
             budget = 30 * 24 * 3600.0
-        o = Options(target_score=float(opts.get("target", 90)), time_budget=budget,
+        t_job0 = time.time()
+        struct_s = float(opts.get("serum_structure_minutes") or 5) * 60
+        o = Options(target_score=float(opts.get("target", 90)),
+                    time_budget=min(budget, struct_s) if mode == "serum_only" else budget,
                     keep_going=bool(opts.get("keep_going", False)),
                     stop=lambda: job.cancel_requested)
         if budget > 900:
@@ -569,18 +594,31 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict, mode: str = "
         opt = Optimizer(y22, OPT_SR, a, o, bank=bank, progress=prog, context_gain=gain22,
                         source_audio=(y44, 44100))
         corrected = False
+        judge = None
+        if mode in ("full", "serum_only") and (opts.get("serum_structure", True) or mode == "serum_only"):
+            judge = make_judge(job, opt, bank, y44, sc, opts, struct_s)
+            opt.judge = judge
         if mode == "full":
-            res = opt.run()
+            try:
+                res = opt.run()
+            finally:
+                if judge is not None:
+                    judge.close()
             if opts.get("serum_tune", False) and float(opts.get("serum_tune_minutes") or 0) > 0:
                 tune_serum(job, res, opt, bank, y44, sc, bpm, float(opts["serum_tune_minutes"]) * 60)
         else:
             serum_host._require_serum()          # these modes need the real plugin
             if mode == "serum_only":
                 job.set("start", "Building the starting patch (analysis guess + custom wavetable)")
-                res = opt.starting_point()
-                job.msg(f"starting patch (no search in our engine): {res.score:.1f}% in our engine; "
-                        "everything else happens inside real Serum 2")
-                tune_serum(job, res, opt, bank, y44, sc, bpm, budget, span=(0.05, 0.9), learnable=False)
+                job.msg("Serum only: parts are screened in our engine but only added or removed when real "
+                        "Serum 2 agrees; the parameters are then tuned in Serum")
+                try:
+                    res = opt.run_serum_only()
+                finally:
+                    if judge is not None:
+                        judge.close()
+                left = budget - (time.time() - t_job0)
+                tune_serum(job, res, opt, bank, y44, sc, bpm, max(30.0, left), span=(0.5, 0.9), learnable=False)
             else:
                 job.set("start", f"Loading result {from_rid}")
                 patch, samples = load_result_patch(pid, from_rid, bank, bpm)
@@ -598,6 +636,17 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict, mode: str = "
             st = getattr(res, "serum_tune", None) or {}
             if not st.get("ok"):
                 raise ValueError(f"tuning in Serum 2 failed: {st.get('error', 'no result')}")
+        serum_structure = None
+        if judge is not None:
+            serum_structure = {**judge.summary(), "checks": judge.checks}
+            if judge.error:
+                job.msg(f"structure checks in real Serum 2 unavailable ({judge.error}); our engine decided alone")
+            elif judge.checks:
+                job.msg(f"real Serum 2 checked {len(judge.checks)} structure decisions in {judge.used_s:.0f} s "
+                        f"({judge.renders} renders) and agreed with our engine on "
+                        f"{sum(c['agreed'] for c in judge.checks)}")
+                from . import calibration
+                calibration.record_checks(judge.checks, {"project": pid, "stem": stem})
         d = res.details
         job.msg(f"waveform similarity {d['waveform_similarity']}%, spectral similarity "
                 f"{d['spectral_similarity']}%, SI-SDR {d['si_sdr_db']} dB; running checks")
@@ -659,6 +708,7 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict, mode: str = "
             "sidechain_logic": SC.logic_settings(sc),
             "patch": res.patch.to_dict(), "description": res.patch.describe(), "stages": res.stages,
             "checks": checks, "serum": serum, "serum_tune": getattr(res, "serum_tune", None),
+            "serum_structure": serum_structure,
             "engine_gap": engine_gap, "analysis": a.summary(), "evals": opt.evals,
             "files": sorted(p.name for p in out.iterdir()),
         }
