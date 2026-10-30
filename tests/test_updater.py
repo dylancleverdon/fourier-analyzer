@@ -60,3 +60,20 @@ def test_missing_dependency_triggers_install(monkeypatch):
     monkeypatch.setattr(main, "REQUIRED_IMPORTS", ("json",))
     main._ensure_dependencies()
     assert not calls
+
+
+def test_windows_layout(monkeypatch, tmp_path):
+    """On Windows the app lives in %LOCALAPPDATA%\\FourierAnalyzer with a
+    Scripts\\ venv; names written to disk are valid Windows names."""
+    import sys
+    from fourier_analyzer import config
+    from fourier_analyzer.project import safe_name
+    monkeypatch.delenv("FA_HOME", raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setattr(sys, "platform", "win32")
+    assert config.app_dir() == tmp_path / "FourierAnalyzer"
+    assert config.venv_python().parts[-2:] == ("Scripts", "python.exe")
+    assert config.venv_python(gui=True).name == "pythonw.exe"
+    assert config.no_window_flags() == 0x08000000
+    assert any("Common Files/VST3" in c for c in config.SERUM_PLUGIN_CANDIDATES)
+    assert safe_name('My: song?/v2. ') == "My_ song__v2"

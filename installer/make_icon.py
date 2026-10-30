@@ -32,4 +32,7 @@ def main(out):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    if sys.argv[1].lower().endswith(".ico"):         # Windows icon
+        draw(256).save(sys.argv[1], sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
+    else:
+        main(sys.argv[1])

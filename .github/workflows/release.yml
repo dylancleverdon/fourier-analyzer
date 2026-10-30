@@ -37,6 +37,8 @@ jobs:
             VERSION COMMIT README.md requirements.txt pyproject.toml fourier_analyzer installer
           cp installer/install.sh dist/install.sh
           cp "installer/Install Fourier Analyzer.command" "dist/Install-Fourier-Analyzer.command"
+          cp installer/windows/install.ps1 dist/install.ps1
+          cp "installer/windows/Install Fourier Analyzer.cmd" "dist/Install-Fourier-Analyzer-Windows.cmd"
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -44,4 +46,5 @@ jobs:
           v="${{ steps.v.outputs.version }}"
           notes=$(git log -1 --pretty=%B | head -c 3000)
           gh release create "v$v" dist/fourier-analyzer.tar.gz dist/install.sh dist/Install-Fourier-Analyzer.command \
+            dist/install.ps1 dist/Install-Fourier-Analyzer-Windows.cmd \
             --title "Fourier Analyzer $v" --notes "$notes" --target "${{ github.sha }}" --latest

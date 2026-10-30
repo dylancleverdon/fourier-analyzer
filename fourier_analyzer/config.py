@@ -17,10 +17,45 @@ def app_dir() -> Path:
         p = Path(env)
     elif sys.platform == "darwin":
         p = Path.home() / "Library" / "Application Support" / APP_NAME
+    elif sys.platform == "win32":
+        p = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / APP_NAME
     else:
         p = Path.home() / ".local" / "share" / APP_NAME
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def is_windows() -> bool:
+    return sys.platform == "win32"
+
+
+def venv_python(gui: bool = False) -> Path:
+    """The app's private Python (pythonw.exe for windowless runs on Windows)."""
+    v = app_dir() / "venv"
+    if is_windows():
+        return v / "Scripts" / ("pythonw.exe" if gui else "python.exe")
+    return v / "bin" / "python"
+
+
+def no_window_flags() -> int:
+    """subprocess creationflags that keep helper processes from flashing a
+    console window on Windows."""
+    return 0x08000000 if is_windows() else 0          # CREATE_NO_WINDOW
+
+
+def reveal(path: Path, select: bool = False) -> None:
+    """Show a file or folder in Finder / Explorer."""
+    import subprocess
+    path = Path(path)
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", "-R", str(path)] if select else ["open", str(path)])
+    elif is_windows():
+        if select:
+            subprocess.Popen(["explorer", "/select,", str(path)])
+        else:
+            os.startfile(str(path))                    # noqa: S606 (Windows only)
+    else:
+        subprocess.Popen(["xdg-open", str(path if not select else path.parent)])
 
 
 def code_dir() -> Path:
@@ -53,7 +88,9 @@ def projects_dir() -> Path:
 
 
 def default_exports_dir() -> Path:
-    return Path.home() / "Music" / "Fourier Analyzer" if sys.platform == "darwin" else data_dir() / "exports"
+    if sys.platform in ("darwin", "win32"):
+        return Path.home() / "Music" / "Fourier Analyzer"
+    return data_dir() / "exports"
 
 
 def exports_dir() -> Path:
@@ -103,17 +140,20 @@ def save_settings(**kw) -> dict:
     return s
 
 
+# Windows: Serum 2 keeps its content under Documents\Xfer (per user or Public)
+_WIN_CONTENT = ["~/Documents/Xfer/Serum 2 Presets", "C:/Users/Public/Documents/Xfer/Serum 2 Presets",
+                "C:/ProgramData/Xfer/Serum 2 Presets", "~/OneDrive/Documents/Xfer/Serum 2 Presets"]
 SERUM_TABLE_CANDIDATES = [
     "~/Documents/Xfer/Serum 2 Presets/Tables",
     "/Library/Audio/Presets/Xfer Records/Serum 2 Presets/Tables",
     "~/Library/Audio/Presets/Xfer Records/Serum 2 Presets/Tables",
     "~/Music/Xfer/Serum 2 Presets/Tables",
-]
+] + [c + "/Tables" for c in _WIN_CONTENT[1:]]
 SERUM_PRESET_CANDIDATES = [
     "~/Documents/Xfer/Serum 2 Presets/Presets",
     "/Library/Audio/Presets/Xfer Records/Serum 2 Presets/Presets",
     "~/Library/Audio/Presets/Xfer Records/Serum 2 Presets/Presets",
-]
+] + [c + "/Presets" for c in _WIN_CONTENT[1:]]
 # VST3 first: it loads more reliably outside a DAW than the Audio Unit
 SERUM_PLUGIN_CANDIDATES = [
     "/Library/Audio/Plug-Ins/VST3/Serum2.vst3",
@@ -122,6 +162,12 @@ SERUM_PLUGIN_CANDIDATES = [
     "~/Library/Audio/Plug-Ins/Components/Serum2.component",
     "/Library/Audio/Plug-Ins/VST3/Serum 2.vst3",
     "/Library/Audio/Plug-Ins/Components/Serum 2.component",
+    # Windows
+    "C:/Program Files/Common Files/VST3/Serum2.vst3",
+    "C:/Program Files/Common Files/VST3/Serum 2.vst3",
+    "C:/Program Files/Common Files/VST3/Xfer Records/Serum2.vst3",
+    "C:/Program Files/Common Files/VST3/Xfer/Serum2.vst3",
+    "~/AppData/Local/Programs/Common/VST3/Serum2.vst3",
 ]
 
 

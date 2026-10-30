@@ -7,7 +7,8 @@ Channel "branch:<name>": the tip of a branch, for testing unreleased work.
 
 The install layout created by installer/install.sh is::
 
-    ~/Library/Application Support/FourierAnalyzer/
+    ~/Library/Application Support/FourierAnalyzer/     (macOS)
+    %LOCALAPPDATA%\FourierAnalyzer\                    (Windows, installer/install.ps1)
         app/      <- code (this package, VERSION, requirements.txt)
         venv/     <- Python environment
 
@@ -26,6 +27,7 @@ import ssl
 import subprocess
 import sys
 import tarfile
+import time
 import urllib.request
 from pathlib import Path
 
@@ -103,22 +105,42 @@ def _install_root() -> Path:
 
 
 def _venv_python() -> Path:
-    vp = config.app_dir() / "venv" / "bin" / "python"
+    vp = config.venv_python()
     return vp if vp.exists() else Path(sys.executable)
 
 
+def _uv() -> str:
+    exe = "uv.exe" if config.is_windows() else "uv"
+    return shutil.which("uv") or str(Path.home() / ".local" / "bin" / exe)
+
+
+def _replace(src: Path, dst: Path, tries: int = 20) -> None:
+    """os.replace, retried: on Windows a virus scanner or the indexer can hold
+    a freshly written file for a moment."""
+    for k in range(tries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if k == tries - 1:
+                raise
+            time.sleep(0.25 * (k + 1))
+
+
 def _pip_install(req: Path, log_cb=None) -> None:
-    uv = shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
-    py = str(_venv_python())
+    uv = _uv()
+    py = str(config.venv_python() if config.venv_python().exists() else _venv_python())
     if Path(uv).exists():
         cmd = [uv, "pip", "install", "--python", py, "-r", str(req)]
     else:
         # venvs made by uv have no pip unless seeded; bootstrap it if needed
-        subprocess.run([py, "-m", "ensurepip", "--upgrade"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        subprocess.run([py, "-m", "ensurepip", "--upgrade"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                       creationflags=config.no_window_flags())
         cmd = [py, "-m", "pip", "install", "-r", str(req)]
     if log_cb:
         log_cb("installing dependencies: " + " ".join(cmd))
-    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                   creationflags=config.no_window_flags())
 
 
 def apply(info: dict | None = None, log_cb=None) -> dict:
@@ -164,20 +186,25 @@ def apply(info: dict | None = None, log_cb=None) -> dict:
     if req_new.exists() and (not req_old.exists() or req_new.read_text() != req_old.read_text()):
         _pip_install(req_new, log_cb)
     shutil.rmtree(old, ignore_errors=True)
-    os.replace(root, old)
+    _replace(root, old)
     try:
-        os.replace(new, root)
+        _replace(new, root)
     except Exception:
-        os.replace(old, root)
+        _replace(old, root)
         raise
     shutil.rmtree(old, ignore_errors=True)
     # refresh the launcher/installer scripts that live outside the code dir
     try:
-        launcher = config.app_dir() / "fourier-analyzer"
-        src = root / "installer" / "launcher.sh"
-        if src.exists():
-            shutil.copy2(src, launcher)
-            launcher.chmod(0o755)
+        if config.is_windows():
+            src = root / "installer" / "windows" / "launch.vbs"
+            if src.exists():
+                shutil.copy2(src, config.app_dir() / "Fourier Analyzer.vbs")
+        else:
+            launcher = config.app_dir() / "fourier-analyzer"
+            src = root / "installer" / "launcher.sh"
+            if src.exists():
+                shutil.copy2(src, launcher)
+                launcher.chmod(0o755)
     except OSError:
         pass
     if log_cb:
@@ -187,5 +214,14 @@ def apply(info: dict | None = None, log_cb=None) -> dict:
 
 def relaunch() -> None:
     """Replace the current process with a fresh app launch."""
+    args = ["-m", "fourier_analyzer", "app"] + [a for a in sys.argv[2:] if a != "--no-update"]
+    if config.is_windows():
+        # no real exec on Windows: start the new app detached, then leave
+        gui = config.venv_python(gui=True)
+        py = str(gui if gui.exists() else _venv_python())
+        env = {**os.environ, "PYTHONPATH": str(config.code_dir())}
+        subprocess.Popen([py] + args, cwd=str(config.app_dir()), env=env,
+                         creationflags=0x00000008 | 0x00000200)   # DETACHED_PROCESS | NEW_PROCESS_GROUP
+        os._exit(0)
     py = str(_venv_python())
-    os.execv(py, [py, "-m", "fourier_analyzer", "app"] + [a for a in sys.argv[2:] if a != "--no-update"])
+    os.execv(py, [py] + args)

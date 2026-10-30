@@ -7,6 +7,15 @@ const api = async (path, opts = {}) => {
   return ct.includes("json") ? r.json() : r;
 };
 const post = (path, body) => api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+const IS_WIN = /Win/i.test(navigator.platform || navigator.userAgent);
+const FILE_MANAGER = IS_WIN ? "File Explorer" : "Finder";
+document.addEventListener("DOMContentLoaded", () => {
+  if (!IS_WIN) return;
+  const nw = document.querySelector("#newWinBtn");
+  if (nw) nw.title = nw.title.replace("⌘N", "Ctrl+N");
+  const dr = document.querySelector("#diagReveal");
+  if (dr) dr.textContent = "Show in File Explorer";
+});
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;" })[c]);
 
 const state = { pid: null, meta: null, stem: null, peaks: null, duration: 0, sel: null, result: null, polling: {} };
@@ -796,7 +805,7 @@ $("#calibrateBtn").onclick = async () => {
     // show the diagnostics file in Finder so it is easy to find and send
     let where = "";
     try { where = (await post("/api/diagnostics/reveal")).path; } catch (e) { /* none written */ }
-    alert("Calibration failed: " + j.error + (where ? `\n\nThe diagnostics file is now selected in Finder:\n${where}\n\nYou can also download it from Settings.` : ""));
+    alert("Calibration failed: " + j.error + (where ? `\n\nThe diagnostics file is now selected in ${FILE_MANAGER}:\n${where}\n\nYou can also download it from Settings.` : ""));
   });
 };
 document.querySelectorAll("[data-pick]").forEach((b) => b.onclick = async () => {

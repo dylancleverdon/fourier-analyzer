@@ -23,6 +23,27 @@ You can also download `Install-Fourier-Analyzer.command` from the latest release
 
 To remove the app, run `bash ~/Library/Application\ Support/FourierAnalyzer/app/installer/uninstall.sh`.
 
+## Install (Windows 10 / 11)
+
+Download **[Install-Fourier-Analyzer-Windows.cmd](https://github.com/dylancleverdon/fourier-analyzer/releases/latest/download/Install-Fourier-Analyzer-Windows.cmd)** and double-click it. The app is unsigned, so Windows SmartScreen may say "Windows protected your PC": click **More info**, then **Run anyway**.
+
+Or paste this into PowerShell:
+
+```powershell
+irm https://github.com/dylancleverdon/fourier-analyzer/releases/latest/download/install.ps1 | iex
+```
+
+The installer needs no admin rights. It:
+
+1. installs a private Python 3.12 (via `uv`) plus all dependencies and `ffmpeg`
+2. installs the app to `%LOCALAPPDATA%\FourierAnalyzer`
+3. adds **Fourier Analyzer** to the Start menu and the desktop (plus **Uninstall Fourier Analyzer** in the Start menu)
+4. downloads the separation models (about 1 GB; the first install downloads about 2 GB in total and takes 5–15 minutes)
+5. finds Serum 2: the VST3 in `C:\Program Files\Common Files\VST3` and the presets under `Documents\Xfer\Serum 2 Presets`. If yours are elsewhere, set the paths in **Settings**
+6. launches the app
+
+The app opens in its own window (Microsoft Edge WebView2, built into Windows 11). Exports go to `Music\Fourier Analyzer`. Updates install automatically, as on the Mac.
+
 ## Updates
 
 Every push to the default branch runs the tests and publishes a new GitHub Release (`.github/workflows/release.yml`).

@@ -23,4 +23,4 @@ audioread>=3.0   # audio-separator imports it; librosa >=0.11 no longer pulls it
 # hosting the real Serum 2 plugin for verification/calibration
 pedalboard>=0.9.14
 # native window
-pywebview>=5.0; sys_platform == "darwin"
+pywebview>=5.0; sys_platform == "darwin" or sys_platform == "win32"

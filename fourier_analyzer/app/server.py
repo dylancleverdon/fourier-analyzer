@@ -43,6 +43,7 @@ def system():
         pb = False
     return {
         "version": config.version(),
+        "platform": __import__("sys").platform,
         "ml_separation": ml_available(),
         "pedalboard": pb,
         "serum_plugin": str(config.serum_plugin_path() or ""),
@@ -78,12 +79,26 @@ def pick_folder(body: PickIn):
         if r.returncode != 0:
             return {"cancelled": True}
         return {"path": r.stdout.strip().rstrip("/")}
+    start = body.start if body.start and Path(body.start).expanduser().exists() else str(Path.home())
     try:
         import webview
-        res = webview.windows[0].create_file_dialog(getattr(webview, "FOLDER_DIALOG", 20))
+        res = webview.windows[0].create_file_dialog(getattr(webview, "FOLDER_DIALOG", 20), directory=start)
+        if isinstance(res, str):
+            res = [res]
         return {"path": res[0]} if res else {"cancelled": True}
     except Exception as e:
-        raise HTTPException(501, f"no folder dialog available: {e}")
+        err = e
+    try:                                       # no native window (browser mode): Tk dialog
+        import tkinter
+        from tkinter import filedialog
+        root = tkinter.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        path = filedialog.askdirectory(initialdir=start, title=body.prompt)
+        root.destroy()
+        return {"path": path} if path else {"cancelled": True}
+    except Exception:
+        raise HTTPException(501, f"no folder dialog available: {err}")
 
 
 @app.post("/api/window/new")
@@ -113,13 +128,10 @@ def diagnostics_file():
 
 @app.post("/api/diagnostics/reveal")
 def reveal_diagnostics():
-    import subprocess
-    import sys
     p = config.diagnostics_path()
     if not p.exists():
         raise HTTPException(404, "no diagnostics yet")
-    if sys.platform == "darwin":
-        subprocess.Popen(["open", "-R", str(p)])
+    config.reveal(p, select=True)
     return {"path": str(p)}
 
 
@@ -465,11 +477,8 @@ def install(pid: str, rid: str):
 
 @app.post("/api/projects/{pid}/results/{rid}/reveal")
 def reveal(pid: str, rid: str):
-    import subprocess
-    import sys
     p = project.project_dir(pid) / "results" / rid
-    if sys.platform == "darwin":
-        subprocess.Popen(["open", str(p)])
+    config.reveal(p)
     return {"path": str(p)}
 
 

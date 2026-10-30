@@ -18,7 +18,21 @@ import sys
 from pathlib import Path
 
 
+def _ensure_streams():
+    """pythonw.exe (the windowless Windows launch) has no stdout/stderr; send
+    them to a log file so prints and logging do not fail."""
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    from . import config
+    f = open(config.app_dir() / "launcher.log", "a", encoding="utf-8", buffering=1)
+    if sys.stdout is None:
+        sys.stdout = f
+    if sys.stderr is None:
+        sys.stderr = f
+
+
 def main(argv=None):
+    _ensure_streams()
     ap = argparse.ArgumentParser(prog="fourier-analyzer")
     sub = ap.add_subparsers(dest="cmd")
     a = sub.add_parser("app")

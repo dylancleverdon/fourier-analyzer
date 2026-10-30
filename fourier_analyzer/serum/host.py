@@ -630,6 +630,8 @@ def render_jobs(renders: list[tuple[bytes, list, float]], sr: int = 44100, timeo
         cmd = [sys.executable, "-m", "fourier_analyzer", "serum-host", str(td / "job.json")]
         try:
             proc = subprocess.run(cmd, cwd=str(config.code_dir()), capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", env=_child_env(),
+                                  creationflags=config.no_window_flags(),
                                   timeout=timeout or (90 + 30 * len(renders)))
         except subprocess.TimeoutExpired:
             raise SerumHostError("Serum 2 did not finish rendering in time (helper process timed out)")
@@ -642,6 +644,12 @@ def render_jobs(renders: list[tuple[bytes, list, float]], sr: int = 44100, timeo
             raise SerumHostError(res.get("error", "unknown error"))
         out = [sf.read(r["out"], dtype="float32")[0] for r in job["renders"]]
         return out, res.get("plugin", "")
+
+
+def _child_env() -> dict:
+    """Environment for the helper process: UTF-8 pipes on every platform."""
+    import os
+    return {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
 
 
 def _require_serum() -> None:
@@ -666,7 +674,8 @@ class SerumSession:
         self.err = open(self.dir / "stderr.log", "w")
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "fourier_analyzer", "serum-host", "serve"], cwd=str(config.code_dir()),
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.err, text=True, bufsize=1)
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.err, text=True, bufsize=1,
+            encoding="utf-8", errors="replace", env=_child_env(), creationflags=config.no_window_flags())
         self.replies: queue.Queue = queue.Queue()
 
         def read():
@@ -774,7 +783,9 @@ def query_params(names, steps: int = 41) -> tuple[dict, str]:
         job = {"mode": "params", "params": list(names), "steps": steps, "result": str(td / "result.json")}
         (td / "job.json").write_text(json.dumps(job))
         proc = subprocess.run([sys.executable, "-m", "fourier_analyzer", "serum-host", str(td / "job.json")],
-                              cwd=str(config.code_dir()), capture_output=True, text=True, timeout=120)
+                              cwd=str(config.code_dir()), capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", env=_child_env(),
+                                  creationflags=config.no_window_flags(), timeout=120)
         if not (td / "result.json").exists():
             raise SerumHostError(f"Serum helper process crashed (exit {proc.returncode}). "
                                  + (proc.stderr or proc.stdout or "")[-1500:])

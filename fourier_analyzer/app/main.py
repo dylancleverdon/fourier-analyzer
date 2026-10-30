@@ -49,9 +49,15 @@ def _ensure_path():
         exe = imageio_ffmpeg.get_ffmpeg_exe()
         link_dir = config.cache_dir() / "bin"
         link_dir.mkdir(exist_ok=True)
-        link = link_dir / "ffmpeg"
-        if not link.exists():
-            link.symlink_to(exe)
+        if config.is_windows():
+            # symlinks need admin rights on Windows: keep a copy named ffmpeg.exe
+            link = link_dir / "ffmpeg.exe"
+            if not link.exists() or link.stat().st_size != os.path.getsize(exe):
+                shutil.copy2(exe, link)
+        else:
+            link = link_dir / "ffmpeg"
+            if not link.exists():
+                link.symlink_to(exe)
         os.environ["PATH"] = str(link_dir) + os.pathsep + os.environ["PATH"]
     except Exception:
         logging.warning("ffmpeg not found; mp3/m4a input may fail")

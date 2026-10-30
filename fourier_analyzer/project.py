@@ -464,6 +464,13 @@ def learn_from_serum(job: Job, res, opt, bank, notes, r44, serum_raw, y44, gain4
         "engine_similarity": rec["engine_gap"].get("similarity")}
 
 
+def safe_name(name: str) -> str:
+    """A file/folder name valid on Windows and macOS."""
+    import re
+    out = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip().rstrip(". ")
+    return out or "untitled"
+
+
 def start_reconstruct(pid: str, stem: str, start, end, opts: dict) -> Job:
     def work(job: Job):
         from .analysis.features import analyze
@@ -539,7 +546,7 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict) -> Job:
         rid = time.strftime("%H%M%S-") + uuid.uuid4().hex[:4]
         out = project_dir(pid) / "results" / rid
         out.mkdir(parents=True)
-        name = f"FA {meta['name'][:24]} {stem} {rid[:6]}"
+        name = safe_name(f"FA {meta['name'][:24]} {stem} {rid[:6]}")
         res.patch.name = name
         from . import calibration
         # learned corrections: the preset is written so real Serum sounds like our render
@@ -587,7 +594,7 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict) -> Job:
             "engine_gap": engine_gap, "analysis": a.summary(), "evals": opt.evals,
             "files": sorted(p.name for p in out.iterdir()),
         }
-        exp = config.exports_dir() / meta["name"][:60] / f"{stem} {rid}"
+        exp = config.exports_dir() / safe_name(meta["name"][:60]) / safe_name(f"{stem} {rid}")
         try:
             shutil.copytree(out, exp, dirs_exist_ok=True)
             summary["export_dir"] = str(exp)
