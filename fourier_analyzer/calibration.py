@@ -567,7 +567,7 @@ def components(patch: Patch) -> list[tuple[str, callable]]:
             return q
         add("sub oscillator", f)
     for j, m in enumerate(patch.mods):
-        if m.amount and not getattr(m, "bypass", False):
+        if m.amount and not getattr(m, "bypass", False) and not m.source.startswith("macro"):
             def f(q, j=j):
                 q.mods[j].amount = 0.0
                 return q
@@ -705,6 +705,59 @@ def report_text(rec: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def emulation_key(label: str) -> str | None:
+    """'FX hyperdim' / 'FX bus 1 reverb' / 'warp BendPos on osc A' /
+    'together: warp Sync on osc A + LFO2 on warp amount' -> 'FX hyperdim',
+    'FX reverb', 'warp BendPos' (None for parts that are not an emulation)."""
+    import re
+    m = re.search(r"\bFX (?:bus \d )?([a-z0-9]+)", label)
+    if m and m.group(1) not in ("order",):
+        return f"FX {m.group(1)}"
+    m = re.search(r"\b(FM|AM|RM) warp", label)
+    if m:
+        return f"warp {m.group(1)}"
+    m = re.search(r"\bwarp (?!on\b)(\w+)", label)
+    if m:
+        return f"warp {m.group(1)}"
+    return None
+
+
+def fix_first(recs: list[dict] | None = None) -> list[dict]:
+    """FX modules and warps ranked by how much they make our engine differ
+    from real Serum: the culprit search's gap explained, plus how often and
+    how far Serum disagreed when they were added or removed."""
+    recs = read_log() if recs is None else recs
+    rows: dict[str, dict] = {}
+
+    def row(k):
+        return rows.setdefault(k, {"emulation": k, "explained": 0.0, "culprit_runs": 0, "checks": 0,
+                                   "disagreed": 0, "gap_sum": 0.0})
+    for r in recs:
+        for c in (r.get("culprits") or {}).get("components", []):
+            k = emulation_key(c["component"])
+            if k and c.get("explains", 0) > 0:
+                x = row(k)
+                x["explained"] += c["explains"]
+                x["culprit_runs"] += 1
+    for c in read_checks():
+        k = emulation_key(c.get("part", ""))
+        if not k:
+            continue
+        x = row(k)
+        x["checks"] += 1
+        if not c.get("agreed", True):
+            x["disagreed"] += 1
+            x["gap_sum"] += abs(c.get("engine_delta", 0.0) - c.get("serum_delta", 0.0))
+    out = []
+    for x in rows.values():
+        x["priority"] = round(x["explained"] + x["gap_sum"], 2)
+        x["explained"] = round(x["explained"], 2)
+        x["gap_sum"] = round(x["gap_sum"], 2)
+        if x["priority"] > 0:
+            out.append(x)
+    return sorted(out, key=lambda x: -x["priority"])[:20]
+
+
 def summary() -> dict:
     """Totals over every logged run for the Engine accuracy page."""
     recs = read_log()
@@ -728,6 +781,7 @@ def summary() -> dict:
                          "avg_serum_delta": round(float(np.mean([c["serum_delta"] for c in v])), 2)}
                         for k, v in by_part.items()), key=lambda x: (-x["disagreed"], -x["checks"]))
     return {
+        "fix_first": fix_first(recs),
         "structure_checks": structure[:30],
         "runs": len(recs),
         "avg_drop": round(float(np.mean([r.get("score_drop", 0) for r in recs])), 2) if recs else None,

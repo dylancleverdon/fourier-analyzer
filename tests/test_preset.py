@@ -114,7 +114,10 @@ def test_every_search_move_sounds_the_same_after_export():
     base = opt.initial_patch()
     base.filter = Filter(enabled=True, type="lp24", cutoff=1500, reso=0.2)
     bad, seen = [], set()
-    for _ in range(2):
+    for stage in range(3):
+        if stage == 2:                         # FX order, parallel bus and compound moves
+            from fourier_analyzer.synth.patch import fx
+            base.fx_chain = [fx("distortion", mode="Tube"), fx("reverb")]
         for name, fn, _f in opt.structure_moves(base):
             if name in seen:
                 continue
@@ -134,4 +137,6 @@ def test_every_search_move_sounds_the_same_after_export():
         base.oscs[0].unison = 3
         base.oscs[1] = Osc(enabled=True, table="basic:square", level=0.4)
     assert len(seen) > 60
+    assert any(n.startswith("FX order") for n in seen) and any("parallel bus" in n for n in seen)
+    assert any(n.startswith("together: ") for n in seen)
     assert not bad, bad

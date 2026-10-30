@@ -425,6 +425,7 @@ class Patch:
     envs: list = field(default_factory=lambda: [Env(), Env(sustain=0.0), Env(sustain=0.0), Env(sustain=0.0)])
     lfos: list = field(default_factory=lambda: [LFO() for _ in range(N_LFOS)])
     macros: list = field(default_factory=lambda: [0.0] * N_MACROS)
+    macro_names: list = field(default_factory=lambda: [""] * N_MACROS)   # labels shown in Serum
     mods: list = field(default_factory=list)
     lfo_buses: list = field(default_factory=list)   # LFO point-mod bus base values
     velo_curve: Optional[list] = None   # VELO graph [[x, y, curve], ...]

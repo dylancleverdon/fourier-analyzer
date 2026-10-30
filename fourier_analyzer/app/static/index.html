@@ -78,6 +78,8 @@
         <div class="ed-head"><h3>Stems</h3>
           <div class="ed-tools">
             <button id="combineBtn" class="ghost" title="Sum the ticked stems/layers into one new stem">Combine selected</button>
+            <button id="saveStemsBtn" class="ghost" title="Save every split instrument as a .wav file in your export folder">Save all stems (.wav)</button>
+            <a id="zipStems" class="btn ghost" title="Download every stem as .wav files in one zip">Download .zip</a>
             <button id="reclipBtn" class="ghost" title="Pick a different part of the original and separate again">Change clip…</button>
           </div></div>
         <div id="stems" class="stems"></div>
@@ -145,6 +147,11 @@
               <div class="muted small">Runs over 15 min keep experimenting after the first full pass (new structures, filters, FX, restarts) and keep the best patch. Press Stop at any time to finish with the best one so far.</div>
             </div>
             <div class="opt checks">
+              <div class="pref"><span>Prefer synthesis</span><input id="preferSynth" type="range" min="0" max="100" value="50" title="How much sample, granular and spectral oscillators (and multi-frame wavetables) cost against their similarity. Warps, FM, filters, FX and routings never cost anything."><span>Prefer accuracy</span></div>
+              <div class="muted small">Samples are only tried once synthesis stops improving (or scores under 70) and must beat it by a margin; you get both presets.</div>
+              <label class="check"><input id="serumCheckpoints" type="checkbox" checked> check the best patch in real Serum 2 throughout the run, every
+                <select id="checkpointMin"><option value="1">1 min</option><option value="3" selected>3 min</option><option value="5">5 min</option><option value="10">10 min</option></select> and after every stage (tune-up in Serum if it lags)</label>
+              <label class="check"><input id="holdout" type="checkbox" checked> hold out the last note (or what's past the first 6 s) and score the patch on it too</label>
               <label class="check"><input id="serumStructure" type="checkbox" checked> confirm structure in real Serum 2: the top
                 <input id="serumFinalists" type="number" min="1" max="12" step="1" value="3" style="width:3.5em"> candidates per round are rendered in Serum and a part is only kept if Serum agrees; Serum time
                 <select id="serumStructMin"><option value="2">2 min</option><option value="5" selected>5 min</option><option value="10">10 min</option><option value="20">20 min</option><option value="30">30 min</option><option value="60">1 hour</option></select></label>
@@ -166,6 +173,8 @@
                 <div id="accBadge" class="badge"></div>
                 <div id="accBars" class="bars"></div>
                 <div id="serumScore" class="muted small"></div>
+                <div id="synthOnly" class="small"></div>
+                <div id="holdoutInfo" class="small"></div>
                 <div id="engineGap" class="small"></div>
                 <div id="scInfo" class="muted small"></div>
               </div>

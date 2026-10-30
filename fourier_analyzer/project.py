@@ -587,6 +587,9 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict, mode: str = "
         o = Options(target_score=float(opts.get("target", 90)),
                     time_budget=min(budget, struct_s) if mode == "serum_only" else budget,
                     keep_going=bool(opts.get("keep_going", False)),
+                    prefer_synthesis=float(opts.get("prefer_synthesis", 0.5)),
+                    checkpoint_minutes=float(opts.get("checkpoint_minutes") or 3.0),
+                    holdout=bool(opts.get("holdout", True)),
                     stop=lambda: job.cancel_requested)
         if budget > 900:
             job.msg(f"long run: {'until stopped' if budget > 7 * 24 * 3600 else f'{budget / 60:.0f} min'}; "
@@ -595,8 +598,15 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict, mode: str = "
                         source_audio=(y44, 44100))
         corrected = False
         judge = None
-        if mode in ("full", "serum_only") and (opts.get("serum_structure", True) or mode == "serum_only"):
-            judge = make_judge(job, opt, bank, y44, sc, opts, struct_s)
+        if mode in ("full", "serum_only") and (opts.get("serum_structure", True) or opts.get("serum_checkpoints", True)
+                                                or mode == "serum_only"):
+            # long runs get more real-Serum time (checkpoints run all along)
+            serum_s = struct_s if budget <= 900 else max(struct_s, min(0.2 * budget, 4 * 3600.0))
+            judge = make_judge(job, opt, bank, y44, sc, opts, serum_s)
+            if judge is not None and not opts.get("serum_structure", True):
+                judge.finalists = 0
+            if judge is not None and not opts.get("serum_checkpoints", True):
+                opt.CHECKPOINT_LAG = float("inf")
             opt.judge = judge
         if mode == "full":
             try:
@@ -647,6 +657,14 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict, mode: str = "
                         f"{sum(c['agreed'] for c in judge.checks)}")
                 from . import calibration
                 calibration.record_checks(judge.checks, {"project": pid, "stem": stem})
+        ho = getattr(res, "holdout", None)
+        if ho:
+            job.msg(f"held-out notes ({ho['start']}-{ho['end']} s, not used for fitting): waveform "
+                    f"{ho['waveform_similarity']}%, spectral {ho['spectral_similarity']}% "
+                    f"(fitted part: {ho['fit_waveform_similarity']}% / {ho['fit_spectral_similarity']}%)")
+        pc = getattr(res, "pitch_check", None)
+        if pc:
+            job.msg(f"transposed-pitch check of the whole patch: {'ok' if pc['ok'] else 'PROBLEM'}: {pc['why']}")
         d = res.details
         job.msg(f"waveform similarity {d['waveform_similarity']}%, spectral similarity "
                 f"{d['spectral_similarity']}%, SI-SDR {d['si_sdr_db']} dB; running checks")
@@ -659,6 +677,15 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict, mode: str = "
             note = SC.add_to_patch(res.patch, sc, bpm, enabled=bool(opts.get("sidechain_in_preset", False)))
             if note:
                 job.msg(note)
+        if not corrected:
+            from .match.macros import assign_macros
+            labels = assign_macros(res.patch)
+            if labels:
+                job.msg("macros: " + ", ".join(labels))
+            if getattr(res, "synth_patch", None) is not None:
+                if sc["detected"]:
+                    SC.add_to_patch(res.synth_patch, sc, bpm, enabled=bool(opts.get("sidechain_in_preset", False)))
+                assign_macros(res.synth_patch)
         rid = time.strftime("%H%M%S-") + uuid.uuid4().hex[:4]
         out = project_dir(pid) / "results" / rid
         out.mkdir(parents=True)
@@ -670,6 +697,19 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict, mode: str = "
                                     name=name, samples=res.samples,
                                     description=f"Reconstructed by Fourier Analyzer, accuracy {res.score:.1f}")
         (out / f"{name}.SerumPreset").write_bytes(preset)
+        synth = None
+        if getattr(res, "synth_patch", None) is not None:
+            sname = name + " synth"
+            res.synth_patch.name = sname
+            (out / f"{sname}.SerumPreset").write_bytes(build_preset_bytes(
+                res.synth_patch if corrected else calibration.apply_corrections(res.synth_patch), bank, name=sname,
+                samples=res.samples, description=f"Synthesis only (no samples), accuracy "
+                                                 f"{res.synth_details['waveform_similarity']:.1f}"))
+            synth = {"name": sname, "file": f"{sname}.SerumPreset", "details": res.synth_details,
+                     "accuracy": res.synth_details["waveform_similarity"],
+                     "description": res.synth_patch.describe()}
+            job.msg(f"two presets: best overall {res.score:.1f}% (uses a sample-based oscillator), "
+                    f"synthesis only {synth['accuracy']:.1f}%")
         write_midi(out / "notes.mid", a.notes, bpm)
         r44 = Renderer(bank, 44100, samples=res.samples).render(res.patch, a.notes, len(y44) / 44100)
         audio.save(out / "render.wav", audio.normalize(r44), 44100)
@@ -709,6 +749,9 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict, mode: str = "
             "patch": res.patch.to_dict(), "description": res.patch.describe(), "stages": res.stages,
             "checks": checks, "serum": serum, "serum_tune": getattr(res, "serum_tune", None),
             "serum_structure": serum_structure,
+            "synth_only": synth, "holdout": getattr(res, "holdout", None),
+            "pitch_check": getattr(res, "pitch_check", None), "checkpoints": getattr(res, "checkpoints", []),
+            "prefer_synthesis": float(opts.get("prefer_synthesis", 0.5)),
             "engine_gap": engine_gap, "analysis": a.summary(), "evals": opt.evals,
             "files": sorted(p.name for p in out.iterdir()),
         }
@@ -726,6 +769,26 @@ def start_reconstruct(pid: str, stem: str, start, end, opts: dict, mode: str = "
         save_meta(pid, meta)
         return summary
     return JOBS.submit("reconstruct", work, project=pid)
+
+
+def save_stems(pid: str, names: list[str] | None = None) -> Path:
+    """Copy stems (all, or ``names``) as WAV files into the export folder:
+    <exports>/<project>/stems/<project> - <instrument>.wav. Returns the folder."""
+    meta = load_meta(pid)
+    d = project_dir(pid)
+    labels = {i["stem"]: i.get("label") for i in meta.get("instruments", [])}
+    out = config.exports_dir() / safe_name(meta["name"][:60]) / "stems"
+    out.mkdir(parents=True, exist_ok=True)
+    for name, rel in meta["stems"].items():
+        if names and name not in names:
+            continue
+        src = d / rel
+        if not src.exists():
+            continue
+        label = "full mix" if name == "mix" else (labels.get(name) or name)
+        tag = name if label == name else f"{label} ({name})"
+        shutil.copy2(src, out / safe_name(f"{meta['name'][:40]} - {tag}.wav"))
+    return out
 
 
 def install_preset(pid: str, rid: str) -> Path:

@@ -123,17 +123,19 @@ class SerumJudge:
         self._cache[key] = out
         return out
 
-    def tune_up(self, patch: Patch, focus: set | None, base: float) -> tuple[Patch, float]:
-        """A short tune-up of the move's own parameters inside Serum: a few
-        random steps around the patch, keeping the best."""
-        ps = P.continuous_params(patch, focus) if focus else []
+    def tune_up(self, patch: Patch, focus: set | None, base: float, renders: int | None = None,
+                all_params: bool = False) -> tuple[Patch, float]:
+        """A short tune-up inside Serum (the move's own parameters, or all of
+        them): a few random steps around the patch, keeping the best."""
+        ps = P.continuous_params(patch, None if all_params else focus) if (focus or all_params) else []
         best_p, best_s = patch, base
-        if not ps or self.tune_renders <= 0:
+        n_renders = self.tune_renders if renders is None else renders
+        if not ps or n_renders <= 0:
             return best_p, best_s
         rng = np.random.default_rng(len(self.checks) + 11)
         x0 = np.array(P.vector(patch, ps))
-        sigma = 0.12
-        for _ in range(self.tune_renders):
+        sigma = 0.12 if not all_params else 0.05
+        for _ in range(n_renders):
             if not self.available():
                 break
             x = np.clip(np.array(P.vector(best_p, ps)) + rng.normal(0, sigma, len(x0)), 0, 1)

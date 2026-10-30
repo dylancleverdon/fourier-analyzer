@@ -114,6 +114,10 @@ def run(open_window: bool = True, port: int | None = None):
         return
     try:
         import webview
+        try:                                   # let .wav / .zip / preset links download in the app window
+            webview.settings["ALLOW_DOWNLOADS"] = True
+        except Exception:
+            pass
         webview.create_window(f"Fourier Analyzer {config.version()}", url, width=1360, height=900,
                               min_size=(900, 600))
         webview.start()

@@ -55,6 +55,8 @@ def test_serum_rejects_what_it_does_not_hear():
     opt, y44 = _setup()
     judge = _judge(opt, y44, session_factory=lambda sr: FakeSession(sr, mute_samples=True))
     opt.judge = judge
+    opt.samples_unlocked = True                     # samples in play from the start ...
+    opt.opts.prefer_synthesis = 0.0                 # ... at no cost, so they make the finalists
     p0 = opt.initial_patch()
     p0.filter.enabled = False
     p, _ = opt.structure_search(p0, opt.evaluate(p0))

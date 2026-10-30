@@ -1315,7 +1315,12 @@ def patch_to_state(patch: Patch, bank: TableBank | None = None, samples=None) ->
     _write_mod_matrix(st, patch, sc, fx_paths, legacy)
 
     # macro labels make the important knobs easy to find
-    if not any(k.startswith("Macro") for k in (patch.serum_extra or {})):
+    names = list(getattr(patch, "macro_names", None) or [])
+    if any(names):
+        for i, lab in enumerate(names[:N_MACROS]):
+            if lab:
+                st[f"Macro{i}"]["name"] = lab
+    elif not any(k.startswith("Macro") for k in (patch.serum_extra or {})):
         labels = ["CUTOFF", "RESO", "DRIVE", "WT POS"]
         for i, lab in enumerate(labels):
             st[f"Macro{i}"].setdefault("name", lab)
@@ -1730,6 +1735,7 @@ def state_to_patch(st: dict, bank: TableBank | None = None, bpm: float = 140.0, 
     p.velo_curve = curve_from_serum(scal.get("velo"))
     p.note_curve = curve_from_serum(scal.get("note"))
     p.macros = [float(_pget(st.get(f"Macro{i}", {}), "kParamValue", 0.0)) / 100 for i in range(N_MACROS)]
+    p.macro_names = [str(st.get(f"Macro{i}", {}).get("name", "") or "") for i in range(N_MACROS)]
     vp = st.get("VoicePanel0", {})
     vg = lambda k, d=0.0: float(_pget(vp, k, d))
     vc = VoiceControl(rand_pan=vg("kParamGlobalRandomOscPan") / 100,

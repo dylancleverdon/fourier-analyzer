@@ -90,6 +90,14 @@ There is deliberately no signing or checksum verification; update speed was prio
 
    7. **Fine-tune inside real Serum 2** (on by default, 2 min to 1 hour, skipped when Serum 2 isn't installed): the main search runs on the app's own copy of Serum's engine, which is fast but approximate. This stage keeps one copy of the real plugin open, renders candidate presets in it over and over, scores each against the original and nudges every continuous parameter with CMA-ES. It restarts whenever it converges, so it keeps working for the time you give it, and it never makes the result worse. The first **Stop** ends the main search and moves on to this stage; a second Stop ends it.
 
+   **Synthesis first.** Warps, FM, filters, FX modules, FX buses and LFO / envelope / matrix routings cost nothing, however many a patch uses. Only sample, granular and spectral oscillators and multi-frame wavetables carry a cost, and candidates are ranked by similarity minus that cost (the **Prefer synthesis ↔ Prefer accuracy** slider sets how much). Sample-based oscillators are tried only once synthesis stops improving, or when it scores under 70, and must beat it by a margin; a kept sample is shortened to the shortest loop that keeps the score, and then one cycle of it is tried as a custom wavetable. When the best patch uses a sample, you get **two presets**: the best overall and the best synthesis-only one, with both scores.
+
+   **Searching like a sound designer.** Besides single parts, the search tries 2–3 parts together (FM + distortion + OTT, distortion + EQ, filter + LFO on cutoff, warp + LFO on warp amount, unison + chorus …), re-orders the FX rack and moves time effects onto a parallel bus. Pruning removes a part, or a pair of parts, only when the score holds without it, so parts that work together stay together. The key knobs are mapped to named macros (CUTOFF, WARP or FM DEPTH, LFO RATE, LFO DEPTH, DRIVE) without changing the sound.
+
+   **Checked against real Serum 2 all the way** (on by default when Serum 2 is installed): besides the structure finalists and pruning, the best patch is rendered in Serum after every stage (wavetable choice, each structure round, pruning, each part of the fine-tune) and every few minutes (setting); if Serum's score lags our engine's, it is tuned up inside Serum before the search continues. The best few fine-tune candidates are compared in Serum, not just the winner. Large patches are fine-tuned in groups (oscillators and warps, then filters and modulation, then FX) before all together, and long runs get more Serum time.
+
+   **Works on every note.** The last note (or whatever lies past the first 6 s) is held out of the fit and the final patch is scored on it too, and the whole patch is played a fifth below and above its notes to make sure no wobble or LFO rate follows the pitch.
+
    **Tune this patch in Serum 2** (under every result) loads that result's preset back into the real plugin and keeps tuning it for the time you pick (2 min to 2 hours). The outcome is saved as a new result; the original stays as it is.
 
    **Serum only** (reconstruct option) skips tuning in the app's engine: starting from the analysis guess with a custom wavetable, parts are screened in the app's engine but only added or removed when real Serum 2 agrees (for the Serum time set in the options), then the parameters are tuned in Serum for the rest of the search time. It shows how fast real Serum is on your machine; every result shows the renders per second.
@@ -139,12 +147,15 @@ For each run it:
 
 Every structure decision checked in real Serum (our engine's score change vs Serum's, and whether they agreed) is logged too; the parts where Serum disagrees most are listed first on the Engine accuracy page.
 
+The page also ranks the **FX modules and warps that differ most from real Serum** (gap explained in the culprit search plus how often and how far Serum disagreed), so those emulations get fixed first.
+
 **Engine accuracy** (top bar) shows the totals: the score drop between our prediction and real Serum, the biggest causes across all runs, the features with the largest drop, the average band differences and the corrections in use. **Export report** saves it all as one JSON file to send in for engine fixes; **Reset corrections** forgets the learned corrections.
 
 ### Running jobs
 
 - **Multiple windows.** **New window** (or ⌘N) opens another analyzer window. Each window can work on its own track, and up to 4 jobs run at once (setting `parallel_jobs`).
 - **Cancel.** A running separation or layer split can be cancelled. **Stop (keep best)** ends a reconstruction early: it finishes a short alignment and exports the best patch found so far.
+- **Stems as .wav.** **Save .wav** on a stem, or **Save all stems (.wav)**, copies the split instruments into your export folder (`<project>/stems/`) and shows them in Finder / File Explorer; **Download .zip** gets them all at once.
 - **Clip first.** **Separate selection** separates only the part you selected, so long songs don't have to be separated in full.
 - **Player.** Playback uses Web Audio, so it starts on the first sample and the playhead follows the audio clock.
 

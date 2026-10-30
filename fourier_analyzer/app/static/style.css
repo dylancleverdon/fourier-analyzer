@@ -156,3 +156,7 @@ dialog menu { display: flex; justify-content: flex-end; gap: 8px; padding: 0; ma
 #engineDlg td:not(:first-child), #engineDlg th:not(:first-child) { text-align: right; white-space: nowrap; }
 #engineGap ul { margin: 4px 0 0 18px; padding: 0; }
 .actions.retune { align-items: center; margin-top: 8px; }
+
+.pref { display: flex; align-items: center; gap: 8px; margin: 6px 0 2px; }
+.pref input[type=range] { flex: 1; }
+.pref span { font-size: 12px; white-space: nowrap; }

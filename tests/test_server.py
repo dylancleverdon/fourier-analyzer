@@ -52,6 +52,14 @@ def test_full_flow(monkeypatch):
     assert abs(meta["duration"] - 2.0) < 0.01 and meta["clip"] == [0.1, 2.1]
     assert "bass" in meta["stems"]
     assert c.get(f"/api/projects/{pid}/peaks/bass").status_code == 200
+    # split instruments as .wav files: saved to the export folder, or as one zip
+    sv = c.post(f"/api/projects/{pid}/stems/save", json={"reveal": False}).json()
+    from pathlib import Path
+    assert len(sv["files"]) == len(meta["stems"]) and all(Path(sv["folder"], f).exists() for f in sv["files"])
+    import zipfile
+    zr = c.get(f"/api/projects/{pid}/stems.zip")
+    assert zr.status_code == 200
+    assert len(zipfile.ZipFile(io.BytesIO(zr.content)).namelist()) == len(meta["stems"])
     # combine two stems into a new one
     cb = c.post(f"/api/projects/{pid}/combine", json={"stems": ["bass", "other"], "name": "bass+other"})
     assert cb.status_code == 200, cb.text

@@ -63,6 +63,13 @@ class Options:
     max_oscs: int = 3
     stop: Callable[[], bool] | None = None   # returns True when the user stops / cancels
     keep_going: bool = False           # do not stop early at the target score (long runs)
+    # 0 = prefer accuracy (samples cost little) .. 1 = prefer synthesis (samples
+    # and multi-frame wavetables cost more); design parts never cost anything
+    prefer_synthesis: float = 0.5
+    sample_floor: float = 70.0         # below this synthesis score, samples may be tried early
+    sample_margin: float = 1.0         # a sample-based part must beat synthesis by this much
+    checkpoint_minutes: float = 3.0    # real-Serum checkpoint interval during long stages
+    holdout: bool = True               # keep some notes out of the fit and score them at the end
 
 
 @dataclass
@@ -76,6 +83,11 @@ class Result:
     used_custom: bool = False
     stages: list = field(default_factory=list)
     samples: SampleBank | None = None
+    synth_patch: Patch | None = None       # best synthesis-only patch (no sample-based oscillator)
+    synth_details: dict | None = None
+    holdout: dict | None = None            # score on notes kept out of the fit
+    pitch_check: dict | None = None        # whole patch at transposed pitches
+    checkpoints: list = field(default_factory=list)
 
 
 class Optimizer:
@@ -94,6 +106,16 @@ class Optimizer:
             y = resample(y, sr, OPT_SR)
         self.full_y = y
         n = int(min(len(y), MAX_OPT_SECONDS * OPT_SR))
+        # hold-out: what lies past the fitted stretch, or else the last note
+        self.holdout_range = None
+        notes_all = sorted(analysis.notes, key=lambda nt: nt.start)
+        if self.opts.holdout:
+            if len(y) / OPT_SR > n / OPT_SR + 1.0:
+                self.holdout_range = (n / OPT_SR, min(len(y) / OPT_SR, 2 * n / OPT_SR))
+            elif len(notes_all) >= 4 and notes_all[-1].start >= 2.0:
+                last = notes_all[-1]
+                n = int(last.start * OPT_SR)
+                self.holdout_range = (last.start, min(len(y) / OPT_SR, last.start + last.duration + 0.3))
         self.y = y[:n]
         self.duration = n / OPT_SR
         self.target = Target(self.y, OPT_SR)
@@ -101,8 +123,10 @@ class Optimizer:
         if context_gain is not None:
             g = np.asarray(context_gain, dtype=np.float64)[:n]
             self.gain = np.pad(g, (0, n - len(g)), constant_values=1.0)
+            self.full_gain = np.asarray(context_gain, dtype=np.float64)
         else:
             self.gain = None
+            self.full_gain = None
         self.samples = samples if samples is not None else SampleBank()
         # full-rate audio for the sample / granular / spectral oscillators
         self.source_audio = source_audio or (self.full_y, OPT_SR)
@@ -111,6 +135,11 @@ class Optimizer:
         self._source_len = 0
         self.move_penalty: dict[str, float] = {}     # ranking penalty per move name
         self.wobble_rejects: list[dict] = []
+        self.samples_unlocked = False                # sample-based moves join once synthesis stalls
+        self.best_synth: tuple | None = None         # (patch, score) without sample-based oscillators
+        self.checkpoints: list[dict] = []
+        self._last_cp = time.time()
+        self._tune_top: list = []
         self._source_root = 60.0
         self.renderer = Renderer(self.bank, OPT_SR, samples=self.samples)
         self._judge = None             # SerumJudge: real Serum 2 confirms structure decisions
@@ -211,8 +240,10 @@ class Optimizer:
 
     # ------------------------------------------------------------------
     def tune(self, patch: Patch, evals: int, focus: set[str] | None = None,
-             sigma: float = 0.18, objective: str = "search", params=None) -> tuple[Patch, float]:
-        """CMA-ES over the continuous parameters (normalised to 0..1)."""
+             sigma: float = 0.18, objective: str = "search", params=None, keep_top: int = 0) -> tuple[Patch, float]:
+        """CMA-ES over the continuous parameters (normalised to 0..1).
+        ``keep_top``: also keep the best few distinct candidates in
+        ``self._tune_top`` (best first) so real Serum can pick among them."""
         import cma
         ps = params if params is not None else P.continuous_params(patch, focus)
         base = self.evaluate(patch, objective)
@@ -226,6 +257,7 @@ class Optimizer:
             "bounds": [0.0, 1.0], "popsize": popsize, "maxfevals": evals,
             "verbose": -9, "seed": 1234, "tolfun": 1e-3})
         best_p, best_s = patch, base
+        top = [(base, patch)] if keep_top else []
         while not es.stop() and self.time_left() > self.reserve:
             xs = es.ask()
             fits = []
@@ -235,7 +267,13 @@ class Optimizer:
                 fits.append(-s)
                 if s > best_s:
                     best_p, best_s = cand, s
+                if keep_top and (len(top) < keep_top or s > top[-1][0]) and all(abs(s - t[0]) > 1e-6 for t in top):
+                    top.append((s, cand))
+                    top.sort(key=lambda t: -t[0])
+                    del top[keep_top:]
             es.tell(xs, fits)
+        if keep_top:
+            self._tune_top = top
         return best_p, best_s
 
     def _tune_1d(self, patch, ps, u0, base, evals, objective="search"):
@@ -332,7 +370,7 @@ class Optimizer:
         self.protected = {(m.source, m.dest) for m in p.mods if m.dest in ("pitch", "voiceamp")}
 
     # ------------------------------------------------------------------
-    def structure_moves(self, p: Patch) -> list[tuple[str, Callable[[Patch], Patch], set]]:
+    def structure_moves(self, p: Patch, samples: bool = True) -> list[tuple[str, Callable[[Patch], Patch], set]]:
         a = self.analysis
         moves = []
 
@@ -552,8 +590,88 @@ class Optimizer:
                 q.glide = 0.03
                 return q
             mv("glide/portamento", f, {"glide"})
-        self._sample_moves(p, mv)
+        self._fx_layout_moves(p, mv)
+        self._compound_moves(p, moves, mv)
+        if samples:
+            self._sample_moves(p, mv)
         return moves
+
+    # ------------------------------------------------------------------
+    PARALLEL_FX = ("reverb", "delay", "chorus", "hyperdim", "flanger", "phaser", "convolve")
+
+    def _fx_layout_moves(self, p: Patch, mv) -> None:
+        """Re-order the FX rack and move time effects onto a parallel bus."""
+        chain = p.fx_chain
+        for j in range(len(chain) - 1):
+            a, b = chain[j].get("type"), chain[j + 1].get("type")
+            if a == b or "split" in (a or "") or "split" in (b or ""):
+                continue
+
+            def f(q, j=j):
+                q.fx_chain[j], q.fx_chain[j + 1] = q.fx_chain[j + 1], q.fx_chain[j]
+                q.mods = [m for m in q.mods if not m.dest.startswith(("fx.", "@fx_chain"))]
+                return q
+            mv(f"FX order: {b} before {a}", f, {"fx"})
+        if not p.fx_buses[0]:
+            for j, m in enumerate(chain):
+                if m.get("type") not in self.PARALLEL_FX:
+                    continue
+
+                def f(q, j=j):
+                    mod = q.fx_chain.pop(j)
+                    mod["mix"] = 1.0                       # fully wet on a send bus
+                    q.fx_buses[0] = [mod]
+                    q.bus_dest[0] = "main"
+                    q.mods = [x for x in q.mods if not x.dest.startswith(("fx.", "@fx_chain"))]
+                    for src in ("osc1", "osc2", "osc3", "noise", "sub", "filter1", "filter2"):
+                        if q.route(src)["dest"] != "filter":
+                            q.routing.setdefault(src, {})["send1"] = 0.35
+                    return q
+                mv(f"FX {m.get('type')} on parallel bus 1", f, {"fx"})
+
+    COMPOUNDS = (
+        ("FM + distortion + OTT", ("FM warp on osc A", "distortion (", "OTT")),
+        ("distortion + EQ", ("FX distortion", "EQ shelves")),
+        ("FM + distortion", ("FM warp on osc A", "FX distortion")),
+        ("filter + LFO on cutoff", ("add filter (lp24)", "LFO*-> filter.cutoff")),
+        ("unison + chorus", ("unison x", "FX chorus")),
+        ("distortion + filter FX", ("FX distortion", "FX filter")),
+    )
+
+    def _compound_moves(self, p: Patch, moves: list, mv) -> None:
+        """2-3 parts at once, like a sound designer would add them (each part
+        alone may not help, together they do)."""
+        def find(pattern):
+            pre, _, post = pattern.partition("*")
+            for name, fn, focus in moves:
+                if name.startswith(pre) and name.endswith(post) and self.SAMPLE_TAG not in name:
+                    return name, fn, focus
+            return None
+        for label, parts in self.COMPOUNDS:
+            found = [find(x) for x in parts]
+            if any(f is None for f in found):
+                continue
+
+            def f(q, fns=tuple(x[1] for x in found)):
+                for fn in fns:
+                    q = fn(q)
+                return q
+            focus = set().union(*(x[2] for x in found))
+            mv(f"together: {' + '.join(x[0] for x in found)}", f, focus)
+        # warp + an LFO on the warp amount (a moving timbre)
+        o0 = p.oscs[0]
+        used = {m.source for m in p.mods}
+        k = next((j for j in range(4) if f"lfo{j + 1}" not in used), None)
+        if o0.warp == "none" and k is not None:
+            lf = self.analysis.lfo
+            for code in ("BendPos", "PWM", "Sync"):
+                def f(q, code=code, k=k):
+                    q.oscs[0].warp, q.oscs[0].warp_amount = code, 0.35
+                    q.lfos[k] = LFO(shape="sine", sync=(lf or {}).get("sync") or "1/4",
+                                    rate_hz=(lf or {}).get("rate_hz") or 2.0, mode="trig")
+                    q.mods.append(Mod(f"lfo{k + 1}", "osc1.warp", 0.4))
+                    return q
+                mv(f"together: warp {code} on osc A + LFO{k + 1} on warp amount", f, {"osc", "mod"})
 
     # ------------------------------------------------------------------
     def source_sample(self) -> tuple[str | None, float]:
@@ -595,7 +713,7 @@ class Optimizer:
                                             name="Fourier Analyzer source" + (" (flattened)" if self._source_flat else ""))
         return self._source_sid, self._source_root
 
-    def wobble_check(self, q: Patch) -> dict:
+    def wobble_check(self, q: Patch, root: float | None = None) -> dict:
         """Render one held note at three pitches (root and a fifth either side)
         and make sure any wobble stays at one rate (the synced LFO's, when
         there is one) instead of following the pitch."""
@@ -604,7 +722,7 @@ class Optimizer:
         lf = self.analysis.lfo
         rate = lf["rate_hz"] if lf and lf.get("sync") else None
         dur = float(np.clip(3.5 / rate, 1.2, 3.0)) if rate else 1.5
-        root = self._source_root
+        root = self._source_root if root is None else root
 
         def render(pt, d):
             return self.renderer.render(q, [Note(0.0, d, pt)], d + 0.05), OPT_SR
@@ -778,25 +896,33 @@ class Optimizer:
             q, s = self.tune(q, per, focus={"osc", "env", "mod"})
             results.append((s, label, q))
             self.report("tables", f"custom wavetable '{label}': {s:.1f}")
-        results.sort(key=lambda r: -r[0])
+        # multi-frame tables cost a little (prefer synthesis): rank by similarity minus cost
+        results.sort(key=lambda r: -self.eff(r[2], r[0]))
         if results:
             score, label, p = results[0]
         self.stages.append({"stage": "custom wavetable", "score": round(score, 2), "table": label,
-                            "candidates": [{"table": t, "score": round(s, 2)} for s, t, _ in results]})
+                            "candidates": [{"table": t, "score": round(s, 2), "cost": round(self.cost(q), 2)}
+                                           for s, t, q in results]})
+        p, score = self.checkpoint(p, score, "wavetable choice")
 
         # --- 3. greedy structure search (finalists confirmed in real Serum) --
         p, score = self.structure_search(p, score)
 
         # --- 4. pruning (ablation) ------------------------------------------
         p, score = self.prune(p, score)
+        p, score = self.checkpoint(p, score, "pruning")
 
         # --- 5. fine-tune ----------------------------------------------------
         budget = int(max(40, self.pass_left() * 0.9 / 0.03))
-        self.set_stage("fine-tune", f"all {len(P.continuous_params(p))} parameters together")
+        n_params = len(P.continuous_params(p))
+        self.set_stage("fine-tune", f"all {n_params} parameters" + (" (in groups first)" if n_params > 30 else ""))
         self.reserve = max(0.0, self.time_left() - self.pass_left())   # the rest belongs to later stages
-        p, score = self.tune(p, budget, sigma=0.08)
+        self._fine_confirm = []
+        p, score = self.fine_tune(p, score, budget)
+        self._note_synth(p, score)
         self.report("fine-tune", f"{score:.1f}")
-        self.stages.append({"stage": "fine-tune", "score": round(score, 2)})
+        self.stages.append({"stage": "fine-tune", "score": round(score, 2),
+                            "serum_confirmations": self._fine_confirm})
 
         # --- 5b. exploration rounds (long searches) ----------------------------
         p, score = self._explore(p, score)
@@ -823,10 +949,35 @@ class Optimizer:
         if self.stopped:
             self.stages.append({"stage": "stopped", "score": round(score, 2),
                                 "note": "stopped by the user; best patch so far"})
+        return self.finish(p, score)
+
+    def finish(self, p: Patch, score: float) -> Result:
+        """Final metrics plus the synthesis-only patch, the hold-out score, the
+        whole-patch transposed-pitch check and the Serum checkpoints."""
         metrics = self.ref.all(self.render(p))
         total = metrics["waveform_similarity"]
-        return Result(patch=p, score=total, details=metrics, notes=self.analysis.notes, bank=self.bank,
-                      history=self.history, used_custom=True, stages=self.stages, samples=self.samples)
+        res = Result(patch=p, score=total, details=metrics, notes=self.analysis.notes, bank=self.bank,
+                     history=self.history, used_custom=True, stages=self.stages, samples=self.samples)
+        if self.uses_samples(p) and self.best_synth is not None:
+            sp, ss = self.best_synth
+            if self.time_left() > 3 and not self.stopped and not getattr(self, "_serum_only", False):
+                self.set_stage("synthesis-only", "tuning the best patch without sample-based oscillators")
+                sp, ss = self.tune(sp, int(min(400, self.time_left() * 0.5 / 0.03)), sigma=0.06)
+            res.synth_patch, res.synth_details = sp, self.ref.all(self.render(sp))
+            self.stages.append({"stage": "synthesis-only preset", "score": round(ss, 2),
+                                "note": f"waveform similarity {res.synth_details['waveform_similarity']}"})
+        try:
+            res.holdout = self.holdout_score(p)
+        except Exception as e:                       # a report, never a reason to fail the run
+            log.warning("hold-out scoring failed: %s", e)
+        lf = self.analysis.lfo
+        if lf and lf.get("sync"):
+            try:
+                res.pitch_check = self.wobble_check(p, root=self.median_root())
+            except Exception as e:
+                log.warning("pitch check failed: %s", e)
+        res.checkpoints = list(self.checkpoints)
+        return res
 
     # ------------------------------------------------------------------
     # real Serum 2 as the judge of structure decisions (see serum_judge.py)
@@ -885,17 +1036,19 @@ class Optimizer:
         if r is None:
             return None, q, s, None
         ss = r[0]
+        cp, cq = self.cost(p), self.cost(q)          # sample-like parts cost the same in both engines
         if kind == "add":
-            ok = ss > base + AGREE_MARGIN
+            need = AGREE_MARGIN + (self.opts.sample_margin if self.SAMPLE_TAG in name else 0.0)
+            ok = ss - cq > base - cp + need
             if not ok and focus and self.judge.tune_renders:
                 self.activity = f"short tune-up in real Serum 2: {name}"
                 q2, ss2 = self.judge.tune_up(q, focus, ss)
                 if ss2 > ss:
                     q, ss = q2, ss2
                     s = self.evaluate(q)
-                    ok = ss > base + AGREE_MARGIN
+                    ok = ss - cq > base - cp + need
         else:
-            ok = ss >= base - AGREE_MARGIN
+            ok = ss - cq >= base - cp - AGREE_MARGIN
         row = self.judge.note(kind, name, score, s, base, ss, accepted=False)
         verb = "adding" if kind == "add" else "removing"
         self.report(self.stage, f"{verb} '{name}': our engine {score:.1f} -> {s:.1f}, real Serum "
@@ -907,21 +1060,227 @@ class Optimizer:
         if ss is not None:
             self._serum_p, self._serum_s = q, ss
 
+    # ------------------------------------------------------------------
+    # synthesis first: only sample-based oscillators and multi-frame
+    # wavetables cost anything; warps, FM, filters, FX, buses and routings are free
+
+    SAMPLE_COST = 8.0
+    MULTIFRAME_COST = 2.0
+    SAMPLE_TAG = "(a note of the original)"
+
+    def cost(self, p: Patch) -> float:
+        f = 2.0 * float(np.clip(self.opts.prefer_synthesis, 0.0, 1.0))
+        c = 0.0
+        for _, o in p.active_oscs():
+            if o.level <= 0:
+                continue
+            if o.type in ("sample", "granular", "spectral", "multisample"):
+                c += self.SAMPLE_COST
+            elif o.type == "wavetable" and o.table.startswith("custom:"):
+                fr = self.bank.custom.get(o.table)
+                if fr is not None and np.ndim(fr) == 2 and fr.shape[0] > 1:
+                    c += self.MULTIFRAME_COST
+        return f * c
+
+    def eff(self, p: Patch, s: float) -> float:
+        """Similarity minus the cost of sample-like parts (what candidates are ranked by)."""
+        return s - self.cost(p)
+
+    @staticmethod
+    def uses_samples(p: Patch) -> bool:
+        return any(o.enabled and o.level > 0 and o.type in ("sample", "granular", "spectral", "multisample")
+                   for o in p.oscs)
+
+    def _note_synth(self, p: Patch, score: float) -> None:
+        """Remember the best synthesis-only patch (exported as its own preset)."""
+        if not self.uses_samples(p) and (self.best_synth is None or score > self.best_synth[1]):
+            self.best_synth = (p, score)
+
+    # ------------------------------------------------------------------
+    # continuous checks against real Serum 2
+
+    CHECKPOINT_LAG = 2.0               # search points Serum may lag our engine before a tune-up
+
+    def checkpoint(self, p: Patch, score: float, label: str) -> tuple[Patch, float]:
+        """Render the current best patch in real Serum. If Serum's score lags
+        our engine's by more than CHECKPOINT_LAG, tune it up inside Serum
+        before the search continues."""
+        self._last_cp = time.time()
+        if self.judge is None or not self.judge.available():
+            return p, score
+        r = self.judge.score(p)
+        if r is None:
+            return p, score
+        ss = r[0]
+        row = {"at": label, "engine": round(score, 2), "serum": round(ss, 2), "lag": round(score - ss, 2),
+               "t": round(time.time() - self.t0, 1)}
+        if score - ss > self.CHECKPOINT_LAG:
+            self.activity = f"Serum lags our engine by {score - ss:.1f}: tune-up inside real Serum 2"
+            q, ss2 = self.judge.tune_up(p, None, ss, renders=max(12, self.judge.tune_renders), all_params=True)
+            if ss2 > ss + 0.1:
+                s2 = self.evaluate(q)
+                row.update(tuned=True, serum_after=round(ss2, 2), engine_after=round(s2, 2))
+                p, score = q, s2
+                self._accept_serum(q, ss2)
+            else:
+                row["tuned"] = False
+        else:
+            self._accept_serum(p, ss)
+        self.checkpoints.append(row)
+        self.report(self.stage, f"Serum checkpoint ({label}): our engine {row['engine']}, real Serum {row['serum']}"
+                    + (f"; tuned in Serum -> {row['serum_after']}" if row.get("tuned") else ""))
+        return p, score
+
+    def maybe_checkpoint(self, p: Patch, score: float, label: str) -> tuple[Patch, float]:
+        if time.time() - self._last_cp >= 60.0 * max(0.25, self.opts.checkpoint_minutes):
+            return self.checkpoint(p, score, label)
+        return p, score
+
+    def confirm_top(self, p: Patch, score: float) -> tuple[Patch, float, dict | None]:
+        """Render the best few candidates of the last tune in real Serum and
+        keep the one Serum likes best (not only our engine's winner)."""
+        top = [t for t in self._tune_top if t[1] is not None][:3]
+        if self.judge is None or len(top) < 2 or not self.judge.available():
+            return p, score, None
+        rows = []
+        for s, q in top:
+            r = self.judge.score(q)
+            if r is None:
+                break
+            rows.append((r[0], s, q))
+        if len(rows) < 2:
+            return p, score, None
+        best = max(rows, key=lambda t: t[0])
+        info = {"candidates": [{"engine": round(s, 2), "serum": round(ss, 2)} for ss, s, _ in rows],
+                "chosen_engine": round(best[1], 2), "chosen_serum": round(best[0], 2),
+                "changed": best[2] is not p and best[1] < score - 1e-9}
+        if info["changed"]:
+            self.report(self.stage, f"real Serum preferred the fine-tune candidate our engine ranked "
+                                    f"{best[1]:.1f} (Serum {best[0]:.1f}) over its winner {score:.1f}")
+        self._accept_serum(best[2], best[0])
+        return best[2], best[1], info
+
+    GROUPS = ({"osc", "sub", "noise"}, {"filter", "mod", "env", "glide"}, {"fx"})
+
+    def fine_tune(self, p: Patch, score: float, evals: int, sigma: float = 0.08) -> tuple[Patch, float]:
+        """Fine-tune in chunks (a Serum checkpoint between chunks); large
+        patches are tuned group by group (oscillators and warps, then filters
+        and modulation, then FX) before all together."""
+        n_params = len(P.continuous_params(p))
+        chunk = int(max(40, 60.0 * max(0.25, self.opts.checkpoint_minutes) / 0.03))
+        done, k = 0, 0
+        confirmations = []
+        while done < evals and self.time_left() > self.reserve + 1:
+            n = min(chunk, evals - done)
+            if n_params > 30:
+                for g in self.GROUPS:
+                    if P.continuous_params(p, g):
+                        self.activity = f"fine-tune: {'/'.join(sorted(g))} parameters"
+                        p, score = self.tune(p, max(20, n // 4), focus=g, sigma=sigma)
+                self.activity = "fine-tune: all parameters"
+                p, score = self.tune(p, max(20, n // 4), sigma=sigma * 0.75, keep_top=3)
+            else:
+                p, score = self.tune(p, n, sigma=sigma, keep_top=3)
+            p, score, info = self.confirm_top(p, score)
+            if info:
+                confirmations.append(info)
+            done += n
+            k += 1
+            sigma = max(0.03, sigma * 0.8)
+            p, score = self.checkpoint(p, score, f"fine-tune part {k}")
+        self._fine_confirm = confirmations
+        return p, score
+
+    # ------------------------------------------------------------------
+    def _refine_sample(self, p: Patch, score: float) -> tuple[Patch, float, list]:
+        """A kept sample-based oscillator: find the shortest loop that keeps
+        the score, then try one cycle of it as a custom wavetable instead."""
+        steps = []
+        idx = next((i for i, o in enumerate(p.oscs) if o.enabled and o.type in ("sample", "granular", "spectral")),
+                   None)
+        if idx is None:
+            return p, score, steps
+        base_eff = self.eff(p, score)
+        o = p.oscs[idx]
+        span = o.smp.loop_end - o.smp.loop_start
+        while span > 0.01 and self.pass_left() > 2:
+            q = p.copy()
+            span *= 0.5
+            q.oscs[idx].smp.loop_end = q.oscs[idx].smp.loop_start + span
+            s = self.evaluate(q)
+            if self.eff(q, s) < base_eff - 0.3:
+                break
+            p, score = q, s
+            steps.append({"added": f"shorter loop ({span:.3f} of the sample)", "score": round(s, 2)})
+        smp = self.samples.get(o.smp.source)
+        if smp is not None and self.pass_left() > 2:
+            data = np.atleast_2d(smp.data)[0].astype(np.float64)
+            root = o.smp.root if o.smp.root is not None else smp.root
+            period = smp.sr / (440.0 * 2 ** ((root - 69) / 12))
+            i0 = int(p.oscs[idx].smp.loop_start * (len(data) - 1))
+            if period >= 8 and i0 + period * 2 < len(data):
+                cyc = np.interp(i0 + np.arange(2048) * period / 2048, np.arange(len(data)), data)
+                cyc = cyc - cyc.mean()
+                cyc = cyc / max(1e-9, float(np.max(np.abs(cyc))))
+                tid = self.bank.add_custom(cyc[None, :])
+                q = p.copy()
+                q.oscs[idx] = Osc(enabled=True, table=tid, level=o.level, octave=o.octave, semi=o.semi,
+                                  fine=o.fine, pan=o.pan)
+                s = self.evaluate(q)
+                if self.eff(q, s) >= self.eff(p, score) - 0.3:
+                    p, score = q, s
+                    steps.append({"added": "one cycle of the sample as a custom wavetable", "score": round(s, 2)})
+        return p, score, steps
+
+    # ------------------------------------------------------------------
+    def median_root(self) -> float:
+        return float(np.median([n.pitch for n in self.notes])) if self.notes else 48.0
+
+    def holdout_score(self, p: Patch) -> dict | None:
+        """Score the patch on the notes kept out of the fit."""
+        if not self.holdout_range:
+            return None
+        a, b = self.holdout_range
+        full_d = len(self.full_y) / OPT_SR
+        y = self.renderer.render(p, self.analysis.notes, full_d)
+        if self.full_gain is not None:
+            g = self.full_gain[: len(y)]
+            y = y[: len(g)] * g
+        i0, i1 = int(a * OPT_SR), int(b * OPT_SR)
+        seg_t, seg_r = self.full_y[i0:i1], y[i0:i1]
+        if len(seg_t) < 2048 or not np.any(seg_t):
+            return None
+        d = Reference(seg_t, OPT_SR).all(seg_r)
+        fit = self.ref.all(self.render(p))
+        return {"start": round(a, 2), "end": round(b, 2), "waveform_similarity": d["waveform_similarity"],
+                "spectral_similarity": d["spectral_similarity"],
+                "fit_waveform_similarity": fit["waveform_similarity"],
+                "fit_spectral_similarity": fit["spectral_similarity"]}
+
     def structure_search(self, p: Patch, score: float, require_serum: bool = False) -> tuple[Patch, float]:
-        """Greedy additions: every possible part is screened in our engine
-        (one render, then a short tune of the top dozen, then a longer tune of
-        the best four); the finalists are rendered in real Serum 2 and a part
-        is kept only if Serum agrees. ``require_serum``: never add on our
-        engine's word alone (Serum-only mode)."""
+        """Greedy additions, the way a sound designer works: every possible
+        part (and 2-3 part combinations) is screened in our engine (one
+        render, a short tune of the top dozen, a longer tune of the best
+        four), ranked by similarity minus the cost of sample-like parts; the
+        finalists are rendered in real Serum 2 and a part is kept only if
+        Serum agrees. Sample-based oscillators join only once synthesis stops
+        improving (or scores below the floor), and must beat it by a margin.
+        ``require_serum``: never add on our engine's word alone."""
         opts = self.opts
         added, checks = [], []
         floor = (self.pass_end - self.t0) * 0.07
+        lf = self.analysis.lfo
+        self._note_synth(p, score)
         while self.pass_left() > floor and score < 99.0:
             if added and not opts.keep_going and self.ref.waveform(self.render(p)) >= opts.target_score:
                 break
             if require_serum and (self.judge is None or not self.judge.available()):
                 break
-            moves = self.structure_moves(p)
+            if not self.samples_unlocked and score < opts.sample_floor:
+                self.samples_unlocked = True
+                self.report("structure", f"synthesis scores {score:.1f} (< {opts.sample_floor:g}): "
+                                         "sample-based oscillators may be tried")
+            moves = self.structure_moves(p, samples=self.samples_unlocked)
             self.set_stage("structure", f"screening {len(moves)} possible additions")
             # quick screen: one render per candidate so every move gets a look
             # however many there are, then a short tune of the top dozen
@@ -933,7 +1292,8 @@ class Optimizer:
                 q = fn(p.copy())
                 quick.append((self.evaluate(q), name, q, focus))
             pen = lambda name: self.move_penalty.get(name, 0.0)       # noqa: E731 (ranking preference)
-            quick.sort(key=lambda r: -(r[0] - pen(r[1])))
+            rank = lambda t: -(self.eff(t[2], t[0]) - pen(t[1]))      # noqa: E731
+            quick.sort(key=rank)
             screened = []
             for _, name, q, focus in quick[:12]:
                 if self.pass_left() < floor * 0.85:
@@ -941,7 +1301,7 @@ class Optimizer:
                 self.activity = f"short tune: {name}"
                 q, s = self.tune(q, 12, focus=focus, sigma=0.2)
                 screened.append((s, name, q, focus))
-            screened.sort(key=lambda r: -(r[0] - pen(r[1])))
+            screened.sort(key=rank)
             tested = []
             for s0, name, q, focus in screened[:4]:
                 if self.pass_left() < floor * 0.85:
@@ -949,20 +1309,28 @@ class Optimizer:
                 self.activity = f"testing best candidate: {name}"
                 q, s = self.tune(q, 48, focus=focus | {"filter", "osc", "env"}, sigma=0.1)
                 tested.append((s, name, q, focus))
-            improvers = sorted((t for t in tested if t[0] > score + 0.25), key=lambda t: -(t[0] - pen(t[1])))
-            # a tuned sample-based candidate must still keep its wobble out of
-            # the sample (rate steady across pitches, at the synced rate)
+            cur = self.eff(p, score)
+
+            def need(name):
+                return 0.25 + (opts.sample_margin if self.SAMPLE_TAG in name else 0.0)
+            improvers = sorted((t for t in tested if self.eff(t[2], t[0]) > cur + need(t[1])), key=rank)
+            # the whole candidate patch at transposed pitches: with a tempo-synced
+            # LFO, no wobble may follow the pitch (sample-based or not)
             checked = []
             for t in improvers:
-                if "(a note of the original)" in t[1] and self.analysis.lfo:
-                    chk = self.wobble_check(t[2])
+                if lf and (lf.get("sync") or self.SAMPLE_TAG in t[1]):
+                    chk = self.wobble_check(t[2], root=None if self.SAMPLE_TAG in t[1] else self.median_root())
                     if not chk["ok"]:
                         self.wobble_rejects.append({"candidate": t[1], "why": chk["why"], "after_tuning": True})
-                        self.report("structure", f"rejected '{t[1]}' after tuning: {chk['why']}")
+                        self.report("structure", f"rejected '{t[1]}': {chk['why']}")
                         continue
                 checked.append(t)
             improvers = checked
             if not improvers:
+                if not self.samples_unlocked and not require_serum:
+                    self.samples_unlocked = True     # synthesis has stopped improving: now try samples
+                    self.report("structure", "synthesis stopped improving: sample-based oscillators may be tried")
+                    continue
                 break
             # finalists in real Serum: the one Serum likes best among those it agrees with
             n_final = self.judge.finalists if self.judge is not None else 0
@@ -973,63 +1341,103 @@ class Optimizer:
                     break
                 judged += 1
                 checks.append(row)
-                if row["ok"] and (choice is None or ss > choice[3]):
+                if row["ok"] and (choice is None or ss - self.cost(q) > choice[3] - self.cost(choice[2])):
                     choice = (s, name, q, ss, row)
             if judged == 0:
                 if require_serum:
                     break
                 s, name, q, _ = improvers[0]          # Serum not available: our engine decides
-                p, score = q, s
-                added.append({"added": name, "score": round(score, 2)})
-                self.report("structure", f"kept '{name}' -> {score:.1f}")
-                continue
-            if choice is None:
-                self.report("structure", "real Serum 2 rejected every finalist; structure search ends")
-                break
-            s, name, q, ss, row = choice
-            row["accepted"] = True
+                step = {"added": name, "score": round(s, 2)}
+                ss = None
+            else:
+                if choice is None:
+                    self.report("structure", "real Serum 2 rejected every finalist; structure search ends")
+                    break
+                s, name, q, ss, row = choice
+                row["accepted"] = True
+                step = {"added": name, "score": round(s, 2), "serum_before": row["serum_before"],
+                        "serum": row["serum_after"], "agreed": True}
             p, score = q, s
             self._accept_serum(q, ss)
-            added.append({"added": name, "score": round(score, 2), "serum_before": row["serum_before"],
-                          "serum": row["serum_after"], "agreed": True})
-            self.report("structure", f"kept '{name}' -> {score:.1f} (real Serum {row['serum_after']:.1f})")
+            if self.cost(p):
+                step["cost"] = round(self.cost(p), 2)
+            added.append(step)
+            self.report("structure", f"kept '{name}' -> {score:.1f}" + (f" (real Serum {ss:.1f})" if ss else ""))
+            if self.SAMPLE_TAG in name:
+                p, score, ref_steps = self._refine_sample(p, score)
+                added += ref_steps
+            self._note_synth(p, score)
+            p, score = self.checkpoint(p, score, f"structure round {len(added)}")
         self.stages.append({"stage": "structure search", "score": round(score, 2), "steps": added,
                             "serum_checks": checks, "wobble_rejects": list(self.wobble_rejects)})
         return p, score
 
     def prune(self, p: Patch, score: float, require_serum: bool = False) -> tuple[Patch, float]:
-        """Remove parts that do not help; a removal our engine allows is
-        confirmed in real Serum 2 (the score must hold there too)."""
+        """Remove a part, or a pair of parts, only when the score (minus the
+        cost of sample-like parts) holds without it. Judged by sound, not by
+        part type: a distortion plus the EQ that shapes it stay together.
+        Removals our engine allows are confirmed in real Serum 2."""
         self.set_stage("prune", "removing components that do not help")
         removed, checks, refused = [], [], set()
+
+        def attempt(name, q, s):
+            nonlocal p, score
+            row, q, s, ss = self.serum_check("remove", name, p, score, q, s)
+            if row is None and require_serum:
+                return False
+            if row is not None:
+                checks.append(row)
+                if not row["ok"]:
+                    refused.add(name)
+                    return False
+                row["accepted"] = True
+                self._accept_serum(q, ss)
+            p, score = q, s
+            step = {"removed": name, "score": round(s, 2)}
+            if row is not None:
+                step.update(serum_before=row["serum_before"], serum=row["serum_after"], agreed=True)
+            removed.append(step)
+            self.report("prune", f"removed unnecessary {name} -> {s:.1f}")
+            return True
+
         changed = True
         while changed and self.pass_left() > (self.pass_end - self.t0) * 0.03:
             changed = False
-            for name, fn in self.prune_moves(p):
+            singles = self.prune_moves(p)
+            for name, fn in singles:
                 if name in refused:
                     continue
                 q = fn(p.copy())
                 s = self.evaluate(q)
-                if s < score - 0.3:
+                if self.eff(q, s) < self.eff(p, score) - 0.3:
                     continue
-                row, q, s, ss = self.serum_check("remove", name, p, score, q, s)
-                if row is None and require_serum:
-                    continue
-                if row is not None:
-                    checks.append(row)
-                    if not row["ok"]:
-                        refused.add(name)
+                if attempt(name, q, s):
+                    changed = True
+                    break
+            if changed:
+                continue
+            # pairs: parts that only make sense together may go together
+            tried = 0
+            for i, (na, fa) in enumerate(singles):
+                if changed or tried >= 40 or self.pass_left() <= (self.pass_end - self.t0) * 0.03:
+                    break
+                qa = fa(p.copy())
+                for nb, fb in singles[i + 1:]:
+                    second = dict(self.prune_moves(qa)).get(nb)
+                    if second is None:
                         continue
-                    row["accepted"] = True
-                    self._accept_serum(q, ss)
-                p, score = q, s
-                step = {"removed": name, "score": round(s, 2)}
-                if row is not None:
-                    step.update(serum_before=row["serum_before"], serum=row["serum_after"], agreed=True)
-                removed.append(step)
-                self.report("prune", f"removed unnecessary {name} -> {s:.1f}")
-                changed = True
-                break
+                    name = f"{na} + {nb}"
+                    if name in refused:
+                        continue
+                    tried += 1
+                    q = second(qa.copy())
+                    s = self.evaluate(q)
+                    if self.eff(q, s) >= self.eff(p, score) - 0.3 and attempt(name, q, s):
+                        changed = True
+                        break
+                    if tried >= 40:
+                        break
+        self._note_synth(p, score)
         self.stages.append({"stage": "pruning", "score": round(score, 2), "steps": removed, "serum_checks": checks})
         return p, score
 
@@ -1037,16 +1445,14 @@ class Optimizer:
         """Serum-only mode: no tuning in our engine beyond screening; parts are
         added and removed only when real Serum 2 agrees. The parameters are
         tuned in Serum afterwards (project.tune_serum)."""
+        self._serum_only = True
         res = self.starting_point()
         p = res.patch
         score = self.evaluate(p)
         if self.judge is not None:
             p, score = self.structure_search(p, score, require_serum=True)
             p, score = self.prune(p, score, require_serum=True)
-        metrics = self.ref.all(self.render(p))
-        return Result(patch=p, score=metrics["waveform_similarity"], details=metrics, notes=self.analysis.notes,
-                      bank=self.bank, history=self.history, used_custom=True, stages=self.stages,
-                      samples=self.samples)
+        return self.finish(p, score)
 
     def _explore(self, p: Patch, score: float) -> tuple[Patch, float]:
         """Extra time beyond the standard schedule: repeated rounds of structure
@@ -1062,7 +1468,7 @@ class Optimizer:
             r += 1
             start_score = score
             self.set_stage("explore", f"round {r}: more structure ideas and restarts")
-            moves = self.structure_moves(p)
+            moves = self.structure_moves(p, samples=self.samples_unlocked)
             screened = []
             for name, fn, focus in moves:
                 if self.time_left() <= self.wave_reserve + 20:
@@ -1070,14 +1476,16 @@ class Optimizer:
                 self.activity = f"round {r}: trying {name}"
                 q, s = self.tune(fn(p.copy()), 24, focus=focus, sigma=0.2)
                 screened.append((s, name, q, focus))
-            screened.sort(key=lambda t: -t[0])
+            screened.sort(key=lambda t: -self.eff(t[2], t[0]))
             for s0, name, q, focus in screened[:6]:
                 if self.time_left() <= self.wave_reserve + 20:
                     break
                 self.activity = f"round {r}: tuning {name}"
                 q, s = self.tune(q, 120, focus=focus | {"filter", "osc", "env", "mod"}, sigma=0.1)
-                if s > score + 0.15:
-                    if "(a note of the original)" in name and self.analysis.lfo and not self.wobble_check(q)["ok"]:
+                need = 0.15 + (self.opts.sample_margin if self.SAMPLE_TAG in name else 0.0)
+                if self.eff(q, s) > self.eff(p, score) + need:
+                    if self.analysis.lfo and (self.analysis.lfo.get("sync") or self.SAMPLE_TAG in name) and \
+                            not self.wobble_check(q, root=None if self.SAMPLE_TAG in name else self.median_root())["ok"]:
                         continue
                     row, q, s, ss = self.serum_check("add", name, p, score, q, s, focus)
                     if row is not None:
@@ -1091,7 +1499,7 @@ class Optimizer:
             for name, fn in self.prune_moves(p):
                 q = fn(p.copy())
                 s = self.evaluate(q)
-                if s >= score - 0.1:
+                if self.eff(q, s) >= self.eff(p, score) - 0.1:
                     row, q, s, ss = self.serum_check("remove", name, p, score, q, s)
                     if row is not None:
                         checks.append(row)
@@ -1109,6 +1517,8 @@ class Optimizer:
                 q, s = self.tune(p, max(40, evals), sigma=sigma)
                 if s > score:
                     p, score = q, s
+            self._note_synth(p, score)
+            p, score = self.checkpoint(p, score, f"exploration round {r}")
             rounds.append({"round": r, "score": round(score, 2), "gain": round(score - start_score, 2)})
             self.report("explore", f"round {r} done: {score:.1f}")
         if rounds:

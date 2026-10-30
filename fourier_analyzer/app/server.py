@@ -307,6 +307,44 @@ def stem_audio(pid: str, stem: str):
     return FileResponse(_stem_path(pid, stem), media_type="audio/wav", filename=f"{stem}.wav")
 
 
+class SaveStemsIn(BaseModel):
+    stems: list[str] | None = None      # None = every stem
+    reveal: bool = True
+
+
+@app.post("/api/projects/{pid}/stems/save")
+def save_stems(pid: str, body: SaveStemsIn):
+    """Copy split instruments as WAV files into the export folder (and show
+    them in Finder / File Explorer)."""
+    folder = project.save_stems(pid, body.stems)
+    if body.reveal:
+        try:
+            config.reveal(folder)
+        except Exception:
+            pass
+    return {"folder": str(folder), "files": sorted(p.name for p in folder.glob("*.wav"))}
+
+
+@app.get("/api/projects/{pid}/stems.zip")
+def stems_zip(pid: str):
+    """Every stem as WAV in one zip (for browser downloads)."""
+    import io
+    import zipfile
+    meta = project.load_meta(pid)
+    d = project.project_dir(pid)
+    labels = {i["stem"]: i.get("label") for i in meta.get("instruments", [])}
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
+        for name, rel in meta["stems"].items():
+            if (d / rel).exists():
+                label = labels.get(name) or name
+                z.write(d / rel, project.safe_name(f"{name}{'' if label == name else ' - ' + label}.wav"))
+    from fastapi.responses import Response
+    fname = project.safe_name(f"{meta['name'][:60]} stems.zip")
+    return Response(buf.getvalue(), media_type="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
+
 @app.get("/api/projects/{pid}/peaks/{stem}")
 def stem_peaks(pid: str, stem: str, n: int = 1600, start: float | None = None, end: float | None = None):
     """Waveform overview. With start/end only that window is returned (for
@@ -407,6 +445,10 @@ class RegionIn(BaseModel):
     serum_structure: bool = True        # confirm structure decisions in real Serum 2 (when installed)
     serum_finalists: int = 3            # candidates per round rendered in real Serum
     serum_structure_minutes: float = 5.0  # real-Serum time for structure decisions
+    serum_checkpoints: bool = True      # check the best patch in real Serum after every stage and every few minutes
+    checkpoint_minutes: float = 3.0
+    prefer_synthesis: float = 0.5       # 0 = prefer accuracy .. 1 = prefer synthesis over samples
+    holdout: bool = True                # score the final patch on notes kept out of the fit
     learn: bool = True                  # compare our engine with Serum, find causes, learn corrections
     learn_minutes: float = 3.0          # time for the culprit search
     verify_serum: bool = True
